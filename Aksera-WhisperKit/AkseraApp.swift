@@ -14,9 +14,10 @@ struct Aksera_WhisperKitApp: App {
     var sharedModelContainer: ModelContainer = {
         let schema = Schema([
             Conversation.self,
+            Bubble.self
         ])
         
-        let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
+        let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
 
         do {
             return try ModelContainer(for: schema, configurations: [modelConfiguration])
