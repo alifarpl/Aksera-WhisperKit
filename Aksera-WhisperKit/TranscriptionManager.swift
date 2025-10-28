@@ -121,12 +121,12 @@ actor TranscriptionManager {
     //SILENCE THRESHOLD
     // Lower = more sensitive (detects quieter speech as silence)
     // Higher = less sensitive (needs louder silence) -> For noisy environments
-    private let silenceThreshold: Float = 0.02 //amplitude threshold for silence
+    private let silenceThreshold: Float = 0.02 // amplitude threshold for silence
     
     //SILENCE DURATION: How many seconds of silence before creating new bubble
     // Lower = splits more frequently
     // Higher = more forgiving of pauses
-    private let silenceDurationForSplit: Double = 2.0 //seconds of silence to trigger new bubble
+    private let silenceDurationForSplit: Double = 2.0 // seconds of silence to trigger new bubble
 
     // Whisper
     private var pipe: WhisperKit?
@@ -206,7 +206,6 @@ actor TranscriptionManager {
             try? await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
         }
         
-        // Then clean up
         tickingTask?.cancel()
         tickingTask = nil
         engine.inputNode.removeTap(onBus: 0)
@@ -217,6 +216,8 @@ actor TranscriptionManager {
         finalizedText = ""
         lastDeltaCandidate = ""
         stableCount = 0
+        lastSpeechTime = Date()
+        silenceDetected = false
     }
 
     private func tick() async {
@@ -226,6 +227,29 @@ actor TranscriptionManager {
 
         let samples = ring.latest(seconds: chunkSeconds)
         guard !samples.isEmpty else { return }
+        
+        // Check for silence by analyzing audio amplitude
+        let isSilent = detectSilence(in: samples)
+        
+        if isSilent {
+            let silenceDuration = Date().timeIntervalSince(lastSpeechTime)
+            
+            // If silence duration exceeds threshold and we have text, trigger new bubble
+            if silenceDuration >= silenceDurationForSplit && !finalizedText.isEmpty && !silenceDetected {
+                silenceDetected = true
+                onSilenceDetected()
+                // Reset for next bubble
+                finalizedText = ""
+                lastDeltaCandidate = ""
+                stableCount = 0
+                return
+            }
+            return // Skip transcription during silence
+        } else {
+            // Speech detected
+            lastSpeechTime = Date()
+            silenceDetected = false
+        }
 
         // Write chunk to temp WAV and transcribe
         let tmpURL = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -319,5 +343,17 @@ actor TranscriptionManager {
         } else {
             return latestWindow
         }
+    }
+    
+    // Detect silence by checking if audio amplitude is below threshold
+    private func detectSilence(in samples: [Float]) -> Bool {
+        guard !samples.isEmpty else { return true }
+        
+        // Calculate RMS (Root Mean Square) amplitude
+        var sumSquares: Float = 0
+        vDSP_svesq(samples, 1, &sumSquares, vDSP_Length(samples.count))
+        let rms = sqrt(sumSquares / Float(samples.count))
+        
+        return rms < silenceThreshold
     }
 }

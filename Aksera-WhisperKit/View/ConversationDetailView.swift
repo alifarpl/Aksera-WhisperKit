@@ -172,23 +172,10 @@ struct ConversationDetailView: View {
         transcriptionManager = TranscriptionManager(
             onLiveUpdate: { live, finalized in
                 Task { @MainActor in
-                    // Update live text immediately (this shows the gradual typing effect)
+                    // ONLY update the live text display
+                    // DO NOT save anything here - only save on silence detection
                     self.currentLiveText = live
-                    
-                    // When text gets finalized (ends with punctuation or stable), save it
-                    if finalized != self.currentFinalizedText && !finalized.isEmpty {
-                        // New finalized text detected
-                        let newContent = String(finalized.dropFirst(self.currentFinalizedText.count))
-                        
-                        if !newContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                            // Verify we're still on the same conversation
-                            if self.conversation.id == conversationID {
-                                self.saveBubbleToCurrentConversation(text: newContent)
-                            }
-                        }
-                        
-                        self.currentFinalizedText = finalized
-                    }
+                    self.currentFinalizedText = finalized
                 }
             },
             onError: { error in
@@ -200,12 +187,9 @@ struct ConversationDetailView: View {
             },
             onSilenceDetected: {
                 Task { @MainActor in
-                    // Silence detected - save current text as a bubble and prepare for new one
-                    if !self.currentLiveText.isEmpty {
-                        // Save everything we have so far
-                        if self.conversation.id == conversationID {
-                            self.saveBubbleToCurrentConversation(text: self.currentLiveText)
-                        }
+                    // Silence detected - save current text as a bubble ONLY if on correct conversation
+                    if !self.currentLiveText.isEmpty && self.conversation.id == conversationID {
+                        self.saveBubbleToCurrentConversation(text: self.currentLiveText)
                         
                         // Clear for next bubble
                         self.currentLiveText = ""
@@ -260,17 +244,17 @@ struct ConversationDetailView: View {
     
     private func stopRecording() {
         Task {
+            // First check which conversation we're on
+            let currentConvID = await MainActor.run { conversation.id }
+            
             await transcriptionManager?.stop()
             
             await MainActor.run {
                 isRecording = false
                 
-                // Save any remaining unfinalized text to THE CURRENT CONVERSATION
-                if !currentLiveText.isEmpty {
-                    let remaining = String(currentLiveText.dropFirst(currentFinalizedText.count))
-                    if !remaining.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        saveBubbleToCurrentConversation(text: remaining)
-                    }
+                // Only save if we're still on the SAME conversation
+                if !currentLiveText.isEmpty && conversation.id == currentConvID {
+                    saveBubbleToCurrentConversation(text: currentLiveText)
                 }
                 
                 currentLiveText = ""
@@ -291,14 +275,14 @@ struct ConversationDetailView: View {
             outputText: trimmedText
         )
         
+        // Insert into model context
+        modelContext.insert(newBubble)
+        
         // CRITICAL: Link bubble to THIS specific conversation
         newBubble.conversation = conversation
         
         // Add to conversation's bubbles array
         conversation.bubbles.append(newBubble)
-        
-        // Insert into model context
-        modelContext.insert(newBubble)
         
         // Force save to ensure it's persisted immediately
         try? modelContext.save()
