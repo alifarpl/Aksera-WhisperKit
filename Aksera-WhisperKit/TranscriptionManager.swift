@@ -140,6 +140,8 @@ actor TranscriptionManager {
     private var running = false
     private var tickingTask: Task<Void, Never>?
     private var isTranscribing = false
+    private var lastSpeechTime: Date = Date()
+    private var silenceDetected: Bool = false
 
     // Text
     private var finalizedText: String = ""
@@ -150,14 +152,16 @@ actor TranscriptionManager {
     // Callbacks
     private let onLiveUpdate: (String, String) -> Void
     private let onError: (Error) -> Void
-    private let onSilenceDetected: () -> Void = {}
+    private let onSilenceDetected: () -> Void
 
     init(
         onLiveUpdate: @escaping (String, String) -> Void,
-        onError: @escaping (Error) -> Void
+        onError: @escaping (Error) -> Void,
+        onSilenceDetected: @escaping () -> Void
     ) {
         self.onLiveUpdate = onLiveUpdate
         self.onError = onError
+        self.onSilenceDetected = onSilenceDetected
     }
 
     func start() async throws {
