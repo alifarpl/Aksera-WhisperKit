@@ -317,7 +317,8 @@ actor TranscriptionManager {
     private func computeDelta(prior: String, latestWindow: String) -> String {
         if prior.isEmpty { return latestWindow }
 
-        let context = String(prior.suffix(200))
+        //use a larger context for better matching
+        let context = String(prior.suffix(300))
         let lowerContext = context.lowercased()
         let lowerWindow = latestWindow.lowercased()
 
@@ -326,11 +327,16 @@ actor TranscriptionManager {
         var bestSuffixLen = 0
         var bestPosInWindow: Int = -1
 
-        let minMatch = 10
+        //increase min match to reduce false positives
+        let minMatch = 15
         let maxLen = ctxChars.count
-        for len in stride(from: min(maxLen, 200), through: minMatch, by: -1) {
+        
+        // try to find the longest match
+        for len in stride(from: min(maxLen, 300), through: minMatch, by: -1) {
             let suffix = String(ctxChars.suffix(len))
-            if let range = lowerWindow.range(of: suffix) {
+            
+            //find the last occurence (most recent)
+            if let range = lowerWindow.range(of: suffix, options: .backwards) {
                 bestSuffixLen = len
                 bestPosInWindow = lowerWindow.distance(from: lowerWindow.startIndex, to: range.upperBound)
                 break
@@ -338,9 +344,32 @@ actor TranscriptionManager {
         }
 
         if bestPosInWindow >= 0 {
+            // Get the new part after the match
             let idx = latestWindow.index(latestWindow.startIndex, offsetBy: bestPosInWindow)
-            return String(latestWindow[idx...])
+            let newPart = String(latestWindow[idx...])
+            
+            // Additional checl: if new part is too similar to what we just added -> skip it
+            let recentPrior = String(prior.suffix(100)).lowercased()
+            let newPartLower = newPart.lowercased()
+            
+            // if the new part is already mostly in the recent prior -> dont add it
+            if !newPart.isEmpty && recentPrior.contains(newPartLower){
+                return ""
+            }
+            
+            return newPart
+            
         } else {
+           // No overkap found, check if window is completely new
+            let windowWords = Set(lowerWindow.split(separator: " "))
+            let priorWords = Set(lowerContext.split(separator: " "))
+            let overlap = windowWords.intersection(priorWords)
+            
+            //If theres significant word overlap, it might be a repeat
+            if !overlap.isEmpty && Double(overlap.count) / Double(windowWords.count) > 0.7 {
+                return "" //Skip probable repetition
+            }
+            
             return latestWindow
         }
     }

@@ -168,6 +168,7 @@ struct ConversationDetailView: View {
     private func initializeTranscriptionManager() async {
         // Capture the conversation ID to ensure we're always saving to the right one
         let conversationID = conversation.id
+        let context = modelContext
         
         transcriptionManager = TranscriptionManager(
             onLiveUpdate: { live, finalized in
@@ -185,11 +186,31 @@ struct ConversationDetailView: View {
                     self.isRecording = false
                 }
             },
-            onSilenceDetected: {
+            onSilenceDetected: { [weak context] in
                 Task { @MainActor in
-                    // Silence detected - save current text as a bubble ONLY if on correct conversation
+                    guard let context = context else { return }
+                    
+                    // Only save if we have text and we're still on the SAME conversation
                     if !self.currentLiveText.isEmpty && self.conversation.id == conversationID {
-                        self.saveBubbleToCurrentConversation(text: self.currentLiveText)
+                        let trimmedText = self.currentLiveText.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !trimmedText.isEmpty else { return }
+                        
+                        // Create and save bubble directly in closure
+                        let newBubble = Bubble(
+                            creationDate: Date(),
+                            type: .speech,
+                            outputText: trimmedText
+                        )
+                        
+                        context.insert(newBubble)
+                        newBubble.conversation = self.conversation
+                        self.conversation.bubbles.append(newBubble)
+                        
+                        do {
+                            try context.save()
+                        } catch {
+                            print("Error saving bubble: \(error)")
+                        }
                         
                         // Clear for next bubble
                         self.currentLiveText = ""
@@ -269,6 +290,7 @@ struct ConversationDetailView: View {
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedText.isEmpty else { return }
         
+        // create bubble without setting conversation first
         let newBubble = Bubble(
             creationDate: Date(),
             type: .speech,
@@ -284,8 +306,12 @@ struct ConversationDetailView: View {
         // Add to conversation's bubbles array
         conversation.bubbles.append(newBubble)
         
-        // Force save to ensure it's persisted immediately
-        try? modelContext.save()
+        // Save immediately
+        do {
+            try modelContext.save()
+        } catch {
+            print("Error saving bubble: \(error)")
+        }
     }
 }
 
@@ -305,6 +331,7 @@ struct BubbleView: View {
             }
             
             Text(bubble.outputText)
+                .textSelection(.enabled)
                 .padding(12)
                 .background(bubble.type == .speech ? Color.blue.opacity(0.15) : Color.gray.opacity(0.1))
                 .cornerRadius(12)
