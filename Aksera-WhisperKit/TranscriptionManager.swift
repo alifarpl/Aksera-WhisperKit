@@ -16,19 +16,19 @@ final class AudioRingBuffer {
     private var samples: [Float] = []
     private var maxSamples: Int
     private(set) var sampleRate: Double
-
+    
     init(sampleRate: Double, maxSeconds: Double) {
         self.sampleRate = sampleRate
         self.maxSamples = Int(sampleRate * maxSeconds)
         self.samples.reserveCapacity(self.maxSamples)
     }
-
+    
     func append(buffer: AVAudioPCMBuffer) {
         guard let channelData = buffer.floatChannelData else { return }
         let channelCount = Int(buffer.format.channelCount)
         let frameCount = Int(buffer.frameLength)
         if frameCount == 0 { return }
-
+        
         // Mix to mono
         var mixed = [Float](repeating: 0, count: frameCount)
         if channelCount == 1 {
@@ -43,7 +43,7 @@ final class AudioRingBuffer {
             var divisor = Float(channelCount)
             vDSP_vsdiv(mixed, 1, &divisor, &mixed, 1, vDSP_Length(frameCount))
         }
-
+        
         queue.sync {
             samples.append(contentsOf: mixed)
             if samples.count > maxSamples {
@@ -51,7 +51,7 @@ final class AudioRingBuffer {
             }
         }
     }
-
+    
     func latest(seconds: Double) -> [Float] {
         let need = Int(seconds * sampleRate)
         return queue.sync {
@@ -70,12 +70,12 @@ enum WavWriter {
             let clipped = max(-1.0, min(1.0, Double(samples[i])))
             int16[i] = Int16(clipped * Double(Int16.max))
         }
-
+        
         let byteRate = UInt32(sampleRate) * 2 // mono, 16-bit
         let blockAlign: UInt16 = 2
         let subchunk2Size = UInt32(int16.count * MemoryLayout<Int16>.size)
         let chunkSize = 36 + subchunk2Size
-
+        
         var data = Data()
         // RIFF header
         data.append("RIFF".data(using: .ascii)!)
@@ -94,7 +94,7 @@ enum WavWriter {
         data.append("data".data(using: .ascii)!)
         data.append(UInt32(subchunk2Size).littleEndianData)
         int16.withUnsafeBytes { rawBuffer in data.append(contentsOf: rawBuffer) }
-
+        
         try data.write(to: url, options: .atomic)
     }
 }
@@ -127,33 +127,33 @@ actor TranscriptionManager {
     // Lower = splits more frequently
     // Higher = more forgiving of pauses
     private let silenceDurationForSplit: Double = 1.5 // seconds of silence to trigger new bubble
-
+    
     // Whisper
     private var pipe: WhisperKit?
-
+    
     // Audio
     private let engine = AVAudioEngine()
     private var ring: AudioRingBuffer?
     private var inputSampleRate: Double = 16000
-
+    
     // State
     private var running = false
     private var tickingTask: Task<Void, Never>?
     private var isTranscribing = false
     private var lastSpeechTime: Date = Date()
     private var silenceDetected: Bool = false
-
+    
     // Text
     private var finalizedText: String = ""
     private var lastDeltaCandidate: String = ""
     private var stableCount: Int = 0
     private let punctuationSet = CharacterSet(charactersIn: ".?!,;：、。？！")
-
+    
     // Callbacks
     private let onLiveUpdate: (String, String) -> Void
     private let onError: (Error) -> Void
     private let onSilenceDetected: () -> Void
-
+    
     init(
         onLiveUpdate: @escaping (String, String) -> Void,
         onError: @escaping (Error) -> Void,
@@ -163,20 +163,20 @@ actor TranscriptionManager {
         self.onError = onError
         self.onSilenceDetected = onSilenceDetected
     }
-
+    
     func start() async throws {
         guard !running else { return }
         running = true
-
-        // Initialize WhisperKit with remote "medium" model
+        
+        // Initialize WhisperKit with remote "medium" model -> try large-v3
         self.pipe = try await WhisperKit(WhisperKitConfig(model: "medium"))
-
+        
         // Prepare audio engine
         let input = engine.inputNode
         let format = input.inputFormat(forBus: 0)
         self.inputSampleRate = format.sampleRate
         self.ring = AudioRingBuffer(sampleRate: inputSampleRate, maxSeconds: maxBufferSeconds)
-
+        
         input.removeTap(onBus: 0)
         input.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
             guard let self else { return }
@@ -185,9 +185,9 @@ actor TranscriptionManager {
                 await self.ring?.append(buffer: buffer)
             }
         }
-
+        
         try engine.start()
-
+        
         // Periodic transcription loop
         tickingTask = Task { [weak self] in
             guard let self else { return }
@@ -197,7 +197,7 @@ actor TranscriptionManager {
             }
         }
     }
-
+    
     func stop() async {
         running = false
         
@@ -219,12 +219,12 @@ actor TranscriptionManager {
         lastSpeechTime = Date()
         silenceDetected = false
     }
-
+    
     private func tick() async {
         guard running, !isTranscribing, let pipe, let ring else { return }
         isTranscribing = true
         defer { isTranscribing = false }
-
+        
         let samples = ring.latest(seconds: chunkSeconds)
         guard !samples.isEmpty else { return }
         
@@ -250,15 +250,15 @@ actor TranscriptionManager {
             lastSpeechTime = Date()
             silenceDetected = false
         }
-
+        
         // Write chunk to temp WAV and transcribe
         let tmpURL = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent(UUID().uuidString)
             .appendingPathExtension("wav")
-
+        
         do {
             try WavWriter.writePCM16(samples: samples, sampleRate: inputSampleRate, to: tmpURL)
-
+            
             let results = try await pipe.transcribe(audioPath: tmpURL.path)
             
             // Check if we're still running (not cancelled)
@@ -268,14 +268,14 @@ actor TranscriptionManager {
             }
             
             let windowText = results.map(\.text).joined(separator: " ")
-
+            
             // Merge with finalized using overlap heuristic
             let delta = computeDelta(prior: finalizedText, latestWindow: windowText)
-
+            
             // Update live immediately
             let combined = finalizedText + delta
             onLiveUpdate(combined, finalizedText)
-
+            
             // Heuristic to finalize
             if endsWithPunctuation(delta) {
                 finalizedText = combined.appending(" ")
@@ -304,138 +304,167 @@ actor TranscriptionManager {
             // Only report non-cancellation errors
             onError(error)
         }
-
+        
         // Cleanup
         try? FileManager.default.removeItem(at: tmpURL)
     }
-
+    
     private func endsWithPunctuation(_ s: String) -> Bool {
         guard let last = s.unicodeScalars.last else { return false }
         return punctuationSet.contains(last)
     }
     
     private func computeDelta(prior: String, latestWindow: String) -> String {
-        // 1️⃣ Handle first chunk
+        // Handle first chunk
         if prior.isEmpty { return latestWindow }
-
-        // 2️⃣ Normalize (case-insensitive, strip punctuation)
-        let normalizedPrior = prior
-            .lowercased()
-            .replacingOccurrences(of: "[^a-z0-9 ]", with: " ", options: .regularExpression)
-        let normalizedWindow = latestWindow
-            .lowercased()
-            .replacingOccurrences(of: "[^a-z0-9 ]", with: " ", options: .regularExpression)
-
-        // 3️⃣ Tokenize into words
-        let priorWords = normalizedPrior.split(separator: " ").map(String.init)
-        let windowWords = normalizedWindow.split(separator: " ").map(String.init)
-        let contextWords = Array(priorWords.suffix(80))  // more context than before
-
-        // 4️⃣ Find fuzzy overlap between suffix of prior and prefix of window
-        var bestOverlap = 0
-        var bestSimilarity: Double = 0.0
-
-        for overlap in stride(from: min(contextWords.count, windowWords.count), through: 2, by: -1) {
-            let suffix = Array(contextWords.suffix(overlap))
-            let prefix = Array(windowWords.prefix(overlap))
-
-            // Compute fuzzy similarity using word-set Jaccard index
-            let suffixSet = Set(suffix)
-            let prefixSet = Set(prefix)
-            let intersection = suffixSet.intersection(prefixSet)
-            let similarity = Double(intersection.count) / Double(max(prefixSet.count, 1))
-
-            if similarity > 0.7 && similarity >= bestSimilarity {
-                bestSimilarity = similarity
-                bestOverlap = overlap
+        
+        // Use character-based matching for better accuracy
+        let context = String(prior.suffix(300))
+        let lowerContext = context.lowercased()
+        let lowerWindow = latestWindow.lowercased()
+        
+        // 1️⃣ Try exact substring matching first (most accurate)
+        var bestPosInWindow = -1
+        
+        let minMatch = 20  
+        let contextChars = Array(lowerContext)
+        
+        // Search for longest suffix of context in window
+        for len in stride(from: min(contextChars.count, 250), through: minMatch, by: -1) {
+            let suffix = String(contextChars.suffix(len))
+            
+            // Find LAST occurrence (most recent)
+            if let range = lowerWindow.range(of: suffix, options: .backwards) {
+                bestPosInWindow = lowerWindow.distance(from: lowerWindow.startIndex, to: range.upperBound)
                 break
             }
         }
-
-        // 5️⃣ Extract new part
-        let newPartWords = Array(windowWords.dropFirst(bestOverlap))
-        var newPart = newPartWords.joined(separator: " ")
-
-        // 6️⃣ Avoid duplicates
-        if !newPart.isEmpty && normalizedPrior.contains(newPart) {
-            return ""
+        
+        // 2️⃣ If exact match found, return new part
+        if bestPosInWindow > 0 {
+            let idx = latestWindow.index(latestWindow.startIndex, offsetBy: bestPosInWindow)
+            var newPart = String(latestWindow[idx...]).trimmingCharacters(in: .whitespaces)
+            
+            // IMPROVED: Normalize for duplicate checking (remove punctuation variations)
+            let normalizedNewPart = newPart.lowercased()
+                .replacingOccurrences(of: "[,.:;!?'\"]", with: "", options: .regularExpression)
+                .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+                .trimmingCharacters(in: .whitespaces)
+            
+            let normalizedPrior = String(prior.suffix(200)).lowercased()
+                .replacingOccurrences(of: "[,.:;!?'\"]", with: "", options: .regularExpression)
+                .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            
+            // Check if normalized version exists in prior
+            if !normalizedNewPart.isEmpty && normalizedPrior.contains(normalizedNewPart) {
+                return ""
+            }
+            
+            // IMPROVED: Check for phrase-level duplicates (5+ word sequences)
+            let newPartWords = normalizedNewPart.split(separator: " ")
+            if newPartWords.count >= 5 {
+                // Check if any 5-word sequence from newPart exists in prior
+                for i in 0...(newPartWords.count - 5) {
+                    let phrase = newPartWords[i..<(i+5)].joined(separator: " ")
+                    if normalizedPrior.contains(phrase) {
+                        // Found a duplicate phrase - trim it out
+                        let wordsToKeep = Array(newPartWords.dropFirst(i + 5))
+                        newPart = wordsToKeep.joined(separator: " ")
+                        if newPart.isEmpty {
+                            return ""
+                        }
+                        break
+                    }
+                }
+            }
+            
+            return newPart
         }
-
-        // 7️⃣ Sentence boundary trimming — avoid starting mid-sentence
-        if let range = newPart.range(of: #"[A-Z0-9]"#, options: .regularExpression),
-           range.lowerBound > newPart.startIndex {
-            // find first capitalized word or number start
-            newPart = String(newPart[range.lowerBound...])
+        
+        // 3️⃣ Fallback: Word-level fuzzy matching
+        let priorWords = lowerContext.split(separator: " ").map(String.init)
+        let windowWords = lowerWindow.split(separator: " ").map(String.init)
+        let contextWords = Array(priorWords.suffix(150))  // More context
+        
+        var bestOverlap = 0
+        var bestScore: Double = 0.0
+        
+        // Try different overlap lengths
+        for overlap in stride(from: min(contextWords.count, windowWords.count), through: 5, by: -1) {  // Increased from 3
+            let suffix = Array(contextWords.suffix(overlap))
+            let prefix = Array(windowWords.prefix(overlap))
+            
+            // Calculate ordered similarity (not just set intersection)
+            var matchCount = 0
+            var orderPenalty = 0.0
+            
+            for i in 0..<min(suffix.count, prefix.count) {
+                if suffix[i] == prefix[i] {
+                    matchCount += 1
+                } else {
+                    // Check if word exists but in wrong position
+                    if prefix.contains(suffix[i]) {
+                        matchCount += 1
+                        orderPenalty += 0.4  // Increased penalty from 0.3
+                    }
+                }
+            }
+            
+            let score = (Double(matchCount) - orderPenalty) / Double(overlap)
+            
+            // Stricter threshold: 75% instead of 70%
+            if score > 0.75 && score > bestScore {
+                bestScore = score
+                bestOverlap = overlap
+            }
         }
-
-        // 8️⃣ Restore original casing/punctuation
-        let originalWords = latestWindow.split(separator: " ").map(String.init)
-        let originalNewPart = Array(originalWords.dropFirst(bestOverlap)).joined(separator: " ")
-
-        return originalNewPart.trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        // 4️⃣ Extract new part
+        if bestOverlap > 0 {
+            let originalWords = latestWindow.split(separator: " ").map(String.init)
+            var newPart = Array(originalWords.dropFirst(bestOverlap)).joined(separator: " ")
+            
+            // IMPROVED: Phrase-level duplicate check
+            let normalizedNewPart = newPart.lowercased()
+                .replacingOccurrences(of: "[,.:;!?'\"]", with: "", options: .regularExpression)
+                .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            
+            let normalizedPrior = String(prior.suffix(200)).lowercased()
+                .replacingOccurrences(of: "[,.:;!?'\"]", with: "", options: .regularExpression)
+                .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            
+            // Check 5-word phrases
+            let newPartWords = normalizedNewPart.split(separator: " ")
+            if newPartWords.count >= 5 {
+                for i in 0...(newPartWords.count - 5) {
+                    let phrase = newPartWords[i..<(i+5)].joined(separator: " ")
+                    if normalizedPrior.contains(phrase) {
+                        let wordsToKeep = Array(newPartWords.dropFirst(i + 5))
+                        newPart = wordsToKeep.joined(separator: " ")
+                        if newPart.isEmpty {
+                            return ""
+                        }
+                        break
+                    }
+                }
+            }
+            
+            return newPart.trimmingCharacters(in: .whitespaces)
+        }
+        
+        // 5️⃣ No overlap found - check word-level similarity
+        let windowSet = Set(windowWords)
+        let priorSet = Set(priorWords)
+        let commonWords = windowSet.intersection(priorSet)
+        
+        // Stricter: 70% instead of 60%
+        if !commonWords.isEmpty && Double(commonWords.count) / Double(windowWords.count) > 0.7 {
+            return ""  // Skip repetition
+        }
+        
+        // Otherwise return full window (new content)
+        return latestWindow
     }
-
-//    private func computeDelta(prior: String, latestWindow: String) -> String {
-//        
-//        // Handle first chunk, no prior text yet
-//        if prior.isEmpty { return latestWindow }
-//
-//        //use a larger context for better matching
-//        let context = String(prior.suffix(300))
-//        let lowerContext = context.lowercased()
-//        let lowerWindow = latestWindow.lowercased()
-//
-//        // Search the longest suffix of context that appears in the window
-//        let ctxChars = Array(lowerContext)
-//        var bestSuffixLen = 0
-//        var bestPosInWindow: Int = -1
-//
-//        //increase min match to reduce false positives
-//        let minMatch = 15
-//        let maxLen = ctxChars.count
-//        
-//        // try to find the longest match
-//        for len in stride(from: min(maxLen, 300), through: minMatch, by: -1) {
-//            let suffix = String(ctxChars.suffix(len))
-//            
-//            //find the last occurence (most recent)
-//            if let range = lowerWindow.range(of: suffix, options: .backwards) {
-//                bestSuffixLen = len
-//                bestPosInWindow = lowerWindow.distance(from: lowerWindow.startIndex, to: range.upperBound)
-//                break
-//            }
-//        }
-//
-//        if bestPosInWindow >= 0 {
-//            // Get the new part after the match
-//            let idx = latestWindow.index(latestWindow.startIndex, offsetBy: bestPosInWindow)
-//            let newPart = String(latestWindow[idx...])
-//            
-//            // Additional checl: if new part is too similar to what we just added -> skip it
-//            let recentPrior = String(prior.suffix(100)).lowercased()
-//            let newPartLower = newPart.lowercased()
-//            
-//            // if the new part is already mostly in the recent prior -> dont add it
-//            if !newPart.isEmpty && recentPrior.contains(newPartLower){
-//                return ""
-//            }
-//            
-//            return newPart
-//            
-//        } else {
-//           // No overkap found, check if window is completely new
-//            let windowWords = Set(lowerWindow.split(separator: " "))
-//            let priorWords = Set(lowerContext.split(separator: " "))
-//            let overlap = windowWords.intersection(priorWords)
-//            
-//            //If theres significant word overlap, it might be a repeat
-//            if !overlap.isEmpty && Double(overlap.count) / Double(windowWords.count) > 0.7 {
-//                return "" //Skip probable repetition
-//            }
-//            
-//            return latestWindow
-//        }
-//    }
     
     // Detect silence by checking if audio amplitude is below threshold
     private func detectSilence(in samples: [Float]) -> Bool {
