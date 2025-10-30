@@ -10,7 +10,7 @@ import AVFoundation
 import WhisperKit
 import Accelerate
 
-// MARK: - Audio Ring Buffer (mono float32)
+// MARK: - Audio Ring Buffer
 final class AudioRingBuffer {
     private let queue = DispatchQueue(label: "AudioRingBuffer.queue")
     private var samples: [Float] = []
@@ -29,11 +29,10 @@ final class AudioRingBuffer {
         let frameCount = Int(buffer.frameLength)
         if frameCount == 0 { return }
         
-        // Mix to mono
         var mixed = [Float](repeating: 0, count: frameCount)
         if channelCount == 1 {
             mixed.withUnsafeMutableBufferPointer { dest in
-                dest.baseAddress!.assign(from: channelData[0], count: frameCount)
+                dest.baseAddress!.update(from: channelData[0], count: frameCount)
             }
         } else {
             for ch in 0..<channelCount {
@@ -52,102 +51,69 @@ final class AudioRingBuffer {
         }
     }
     
-    func latest(seconds: Double) -> [Float] {
-        let need = Int(seconds * sampleRate)
-        return queue.sync {
-            if need >= samples.count { return samples }
-            return Array(samples.suffix(need))
-        }
+    func allSamples() -> [Float] {
+        return queue.sync { samples }
+    }
+    
+    func sampleCount() -> Int {
+        return queue.sync { samples.count }
     }
 }
 
-// MARK: - WAV Writer (16-bit PCM)
-enum WavWriter {
-    static func writePCM16(samples: [Float], sampleRate: Double, to url: URL) throws {
-        // Convert float [-1,1] -> Int16
-        var int16 = [Int16](repeating: 0, count: samples.count)
-        for i in 0..<samples.count {
-            let clipped = max(-1.0, min(1.0, Double(samples[i])))
-            int16[i] = Int16(clipped * Double(Int16.max))
-        }
-        
-        let byteRate = UInt32(sampleRate) * 2 // mono, 16-bit
-        let blockAlign: UInt16 = 2
-        let subchunk2Size = UInt32(int16.count * MemoryLayout<Int16>.size)
-        let chunkSize = 36 + subchunk2Size
-        
-        var data = Data()
-        // RIFF header
-        data.append("RIFF".data(using: .ascii)!)
-        data.append(UInt32(chunkSize).littleEndianData)
-        data.append("WAVE".data(using: .ascii)!)
-        // fmt
-        data.append("fmt ".data(using: .ascii)!)
-        data.append(UInt32(16).littleEndianData)               // PCM chunk size
-        data.append(UInt16(1).littleEndianData)                // PCM format
-        data.append(UInt16(1).littleEndianData)                // mono
-        data.append(UInt32(sampleRate).littleEndianData)       // sample rate
-        data.append(UInt32(byteRate).littleEndianData)         // byte rate
-        data.append(blockAlign.littleEndianData)               // block align
-        data.append(UInt16(16).littleEndianData)               // bits per sample
-        // data
-        data.append("data".data(using: .ascii)!)
-        data.append(UInt32(subchunk2Size).littleEndianData)
-        int16.withUnsafeBytes { rawBuffer in data.append(contentsOf: rawBuffer) }
-        
-        try data.write(to: url, options: .atomic)
-    }
-}
-
-private extension UInt16 {
-    var littleEndianData: Data {
-        var val = self.littleEndian
-        return Data(bytes: &val, count: MemoryLayout<UInt16>.size)
-    }
-}
-private extension UInt32 {
-    var littleEndianData: Data {
-        var val = self.littleEndian
-        return Data(bytes: &val, count: MemoryLayout<UInt32>.size)
-    }
-}
-
-// MARK: - Transcription Manager
+// MARK: - Transcription Manager - WhisperAX Implementation
 actor TranscriptionManager {
-    // Tuning
-    private let chunkSeconds: Double = 5.0     // window length
-    private let hopSeconds: Double = 0.5      // how often to run
-    private let maxBufferSeconds: Double = 30  // rolling audio
-    //SILENCE THRESHOLD
-    // Lower = more sensitive (detects quieter speech as silence)
-    // Higher = less sensitive (needs louder silence) -> For noisy environments
-    private let silenceThreshold: Float = 0.02 // amplitude threshold for silence
-    
-    //SILENCE DURATION: How many seconds of silence before creating new bubble
-    // Lower = splits more frequently
-    // Higher = more forgiving of pauses
-    private let silenceDurationForSplit: Double = 1.5 // seconds of silence to trigger new bubble
-    
-    // Whisper
-    private var pipe: WhisperKit?
+    // WhisperAX @AppStorage equivalents
+    private let selectedTask: String = "transcribe"
+    private let selectedLanguage: String = "english"
+    private let enableTimestamps: Bool = true
+    private let enablePromptPrefill: Bool = true
+    private let enableCachePrefill: Bool = true
+    private let enableSpecialCharacters: Bool = false
+    private let temperatureStart: Double = 0
+    private let fallbackCount: Double = 5
+    private let compressionCheckWindow: Double = 60
+    private let sampleLength: Double = 224
+    private let tokenConfirmationsNeeded: Double = 2
     
     // Audio
     private let engine = AVAudioEngine()
     private var ring: AudioRingBuffer?
     private var inputSampleRate: Double = 16000
     
+    // WhisperKit
+    private var whisperKit: WhisperKit?
+    
     // State
     private var running = false
     private var tickingTask: Task<Void, Never>?
     private var isTranscribing = false
+    
+    // WhisperAX eager mode properties
+    private var eagerResults: [TranscriptionResult?] = []
+    private var prevResult: TranscriptionResult?
+    private var lastAgreedSeconds: Float = 0.0
+    private var prevWords: [WordTiming] = []
+    private var lastAgreedWords: [WordTiming] = []
+    private var confirmedWords: [WordTiming] = []
+    private var confirmedText: String = ""
+    private var hypothesisWords: [WordTiming] = []
+    private var hypothesisText: String = ""
+    
+    // UI update properties
+    private var currentText: String = ""
+    private var currentFallbacks: Int = 0
+    private var currentDecodingLoops: Int = 0
+    
+    // Performance metrics (optional)
+    private var tokensPerSecond: TimeInterval = 0
+    private var firstTokenTime: TimeInterval = 0
+    private var effectiveRealTimeFactor: TimeInterval = 0
+    
+    // Silence detection for bubble creation
+    private let silenceThreshold: Double = 0.3
+    private let silenceDurationForSplit: Double = 1.5
     private var lastSpeechTime: Date = Date()
     private var silenceDetected: Bool = false
-    
-    // Text
-    private var finalizedText: String = ""
-    private var lastDeltaCandidate: String = ""
-    private var stableCount: Int = 0
-    private let punctuationSet = CharacterSet(charactersIn: ".?!,;：、。？！")
     
     // Callbacks
     private let onLiveUpdate: (String, String) -> Void
@@ -168,14 +134,35 @@ actor TranscriptionManager {
         guard !running else { return }
         running = true
         
-        // Initialize WhisperKit with remote "medium" model -> try large-v3
-        self.pipe = try await WhisperKit(WhisperKitConfig(model: "medium"))
+        // WhisperKit initialization from WhisperAX
+        let config = WhisperKitConfig(
+            model: "medium",
+            computeOptions: ModelComputeOptions(
+                audioEncoderCompute: .cpuAndNeuralEngine,
+                textDecoderCompute: .cpuAndNeuralEngine
+            ),
+            verbose: true,
+            logLevel: .debug,
+            prewarm: false,
+            load: true,
+            download: true
+        )
         
-        // Prepare audio engine
+        self.whisperKit = try await WhisperKit(config)
+        
+        guard whisperKit?.textDecoder.supportsWordTimestamps == true else {
+            throw NSError(
+                domain: "TranscriptionManager",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Eager mode requires word timestamps, which are not supported by the current model"]
+            )
+        }
+        
+        // Setup audio engine
         let input = engine.inputNode
         let format = input.inputFormat(forBus: 0)
         self.inputSampleRate = format.sampleRate
-        self.ring = AudioRingBuffer(sampleRate: inputSampleRate, maxSeconds: maxBufferSeconds)
+        self.ring = AudioRingBuffer(sampleRate: inputSampleRate, maxSeconds: 30)
         
         input.removeTap(onBus: 0)
         input.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
@@ -188,11 +175,11 @@ actor TranscriptionManager {
         
         try engine.start()
         
-        // Periodic transcription loop
+        // Start transcription loop
         tickingTask = Task { [weak self] in
             guard let self else { return }
             while await self.running {
-                try? await Task.sleep(nanoseconds: UInt64(hopSeconds * 1_000_000_000))
+                try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 second (realtimeDelayInterval)
                 await self.tick()
             }
         }
@@ -201,9 +188,8 @@ actor TranscriptionManager {
     func stop() async {
         running = false
         
-        // Wait for any in-progress transcription to complete
         while isTranscribing {
-            try? await Task.sleep(nanoseconds: 100_000_000) // 0.1 seconds
+            try? await Task.sleep(nanoseconds: 100_000_000)
         }
         
         tickingTask?.cancel()
@@ -213,268 +199,200 @@ actor TranscriptionManager {
     }
     
     func reset() {
-        finalizedText = ""
-        lastDeltaCandidate = ""
-        stableCount = 0
+        // WhisperAX reset
+        eagerResults = []
+        prevResult = nil
+        lastAgreedSeconds = 0.0
+        prevWords = []
+        lastAgreedWords = []
+        confirmedWords = []
+        confirmedText = ""
+        hypothesisWords = []
+        hypothesisText = ""
+        currentText = ""
+        currentFallbacks = 0
+        currentDecodingLoops = 0
         lastSpeechTime = Date()
         silenceDetected = false
     }
     
     private func tick() async {
-        guard running, !isTranscribing, let pipe, let ring else { return }
+        guard running, !isTranscribing, let whisperKit, let ring else { return }
         isTranscribing = true
         defer { isTranscribing = false }
         
-        let samples = ring.latest(seconds: chunkSeconds)
+        let samples = ring.allSamples()
         guard !samples.isEmpty else { return }
         
-        // Check for silence by analyzing audio amplitude
+        // Silence detection
         let isSilent = detectSilence(in: samples)
-        
         if isSilent {
             let silenceDuration = Date().timeIntervalSince(lastSpeechTime)
-            
-            // If silence duration exceeds threshold and we have text, trigger new bubble
-            if silenceDuration >= silenceDurationForSplit && !finalizedText.isEmpty && !silenceDetected {
+            if silenceDuration >= silenceDurationForSplit && !confirmedText.isEmpty && !silenceDetected {
                 silenceDetected = true
                 onSilenceDetected()
-                // Reset for next bubble
-                finalizedText = ""
-                lastDeltaCandidate = ""
-                stableCount = 0
+                reset()
                 return
             }
-            return // Skip transcription during silence
+            return
         } else {
-            // Speech detected
             lastSpeechTime = Date()
             silenceDetected = false
         }
         
-        // Write chunk to temp WAV and transcribe
-        let tmpURL = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent(UUID().uuidString)
-            .appendingPathExtension("wav")
-        
+        // Transcribe
         do {
-            try WavWriter.writePCM16(samples: samples, sampleRate: inputSampleRate, to: tmpURL)
-            
-            let results = try await pipe.transcribe(audioPath: tmpURL.path)
-            
-            // Check if we're still running (not cancelled)
-            guard running else {
-                try? FileManager.default.removeItem(at: tmpURL)
-                return
-            }
-            
-            let windowText = results.map(\.text).joined(separator: " ")
-            
-            // Merge with finalized using overlap heuristic
-            let delta = computeDelta(prior: finalizedText, latestWindow: windowText)
-            
-            // Update live immediately
-            let combined = finalizedText + delta
-            onLiveUpdate(combined, finalizedText)
-            
-            // Heuristic to finalize
-            if endsWithPunctuation(delta) {
-                finalizedText = combined.appending(" ")
-                lastDeltaCandidate = ""
-                stableCount = 0
-                onLiveUpdate(finalizedText, finalizedText)
-            } else {
-                if delta == lastDeltaCandidate {
-                    stableCount += 1
-                } else {
-                    lastDeltaCandidate = delta
-                    stableCount = 1
-                }
-                if stableCount >= 3 {
-                    finalizedText = combined.appending(" ")
-                    lastDeltaCandidate = ""
-                    stableCount = 0
-                    onLiveUpdate(finalizedText, finalizedText)
-                }
-            }
+            try await transcribeEagerMode(samples: samples, whisperKit: whisperKit)
         } catch is CancellationError {
-            // Silently ignore cancellation errors - this is expected when stopping
-            try? FileManager.default.removeItem(at: tmpURL)
             return
         } catch {
-            // Only report non-cancellation errors
             onError(error)
         }
-        
-        // Cleanup
-        try? FileManager.default.removeItem(at: tmpURL)
     }
     
-    private func endsWithPunctuation(_ s: String) -> Bool {
-        guard let last = s.unicodeScalars.last else { return false }
-        return punctuationSet.contains(last)
-    }
-    
-    private func computeDelta(prior: String, latestWindow: String) -> String {
-        // Handle first chunk
-        if prior.isEmpty { return latestWindow }
+    // transcribeEagerMode from WhisperAX ContentView.swift lines 642-731
+    private func transcribeEagerMode(samples: [Float], whisperKit: WhisperKit) async throws {
+        let languageCode = Constants.languages[selectedLanguage, default: Constants.defaultLanguageCode]
+        let task: DecodingTask = selectedTask == "transcribe" ? .transcribe : .translate
         
-        // Use character-based matching for better accuracy
-        let context = String(prior.suffix(300))
-        let lowerContext = context.lowercased()
-        let lowerWindow = latestWindow.lowercased()
+        let options = DecodingOptions(
+            verbose: true,
+            task: task,
+            language: languageCode,
+            temperature: Float(temperatureStart),
+            temperatureFallbackCount: Int(fallbackCount),
+            sampleLength: Int(sampleLength),
+            usePrefillPrompt: enablePromptPrefill,
+            usePrefillCache: enableCachePrefill,
+            skipSpecialTokens: !enableSpecialCharacters,
+            withoutTimestamps: !enableTimestamps,
+            wordTimestamps: true,
+            firstTokenLogProbThreshold: -1.5,
+            chunkingStrategy: .none
+        )
         
-        // 1️⃣ Try exact substring matching first (most accurate)
-        var bestPosInWindow = -1
-        
-        let minMatch = 20  
-        let contextChars = Array(lowerContext)
-        
-        // Search for longest suffix of context in window
-        for len in stride(from: min(contextChars.count, 250), through: minMatch, by: -1) {
-            let suffix = String(contextChars.suffix(len))
-            
-            // Find LAST occurrence (most recent)
-            if let range = lowerWindow.range(of: suffix, options: .backwards) {
-                bestPosInWindow = lowerWindow.distance(from: lowerWindow.startIndex, to: range.upperBound)
-                break
-            }
-        }
-        
-        // 2️⃣ If exact match found, return new part
-        if bestPosInWindow > 0 {
-            let idx = latestWindow.index(latestWindow.startIndex, offsetBy: bestPosInWindow)
-            var newPart = String(latestWindow[idx...]).trimmingCharacters(in: .whitespaces)
-            
-            // IMPROVED: Normalize for duplicate checking (remove punctuation variations)
-            let normalizedNewPart = newPart.lowercased()
-                .replacingOccurrences(of: "[,.:;!?'\"]", with: "", options: .regularExpression)
-                .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-                .trimmingCharacters(in: .whitespaces)
-            
-            let normalizedPrior = String(prior.suffix(200)).lowercased()
-                .replacingOccurrences(of: "[,.:;!?'\"]", with: "", options: .regularExpression)
-                .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-            
-            // Check if normalized version exists in prior
-            if !normalizedNewPart.isEmpty && normalizedPrior.contains(normalizedNewPart) {
-                return ""
-            }
-            
-            // IMPROVED: Check for phrase-level duplicates (5+ word sequences)
-            let newPartWords = normalizedNewPart.split(separator: " ")
-            if newPartWords.count >= 5 {
-                // Check if any 5-word sequence from newPart exists in prior
-                for i in 0...(newPartWords.count - 5) {
-                    let phrase = newPartWords[i..<(i+5)].joined(separator: " ")
-                    if normalizedPrior.contains(phrase) {
-                        // Found a duplicate phrase - trim it out
-                        let wordsToKeep = Array(newPartWords.dropFirst(i + 5))
-                        newPart = wordsToKeep.joined(separator: " ")
-                        if newPart.isEmpty {
-                            return ""
-                        }
-                        break
+        // early stopping checks from WhisperAX lines 586-615
+        let decodingCallback: ((TranscriptionProgress) -> Bool?) = { progress in
+            DispatchQueue.main.async {
+                let fallbacks = Int(progress.timings.totalDecodingFallbacks)
+                if progress.text.count < self.currentText.count {
+                    if fallbacks == self.currentFallbacks {
+                        // New window
+                    } else {
+                        print("Fallback occurred: \(fallbacks)")
                     }
                 }
+                self.currentText = progress.text
+                self.currentFallbacks = fallbacks
+                self.currentDecodingLoops += 1
             }
             
-            return newPart
+            // Check early stopping
+            let currentTokens = progress.tokens
+            let checkWindow = Int(self.compressionCheckWindow)
+            if currentTokens.count > checkWindow {
+                let checkTokens: [Int] = currentTokens.suffix(checkWindow)
+                let compressionRatio = TextUtilities.compressionRatio(of: checkTokens)
+                if compressionRatio > options.compressionRatioThreshold! {
+                    print("[EagerMode] Early stopping due to compression threshold")
+                    return false
+                }
+            }
+            if progress.avgLogprob! < options.logProbThreshold! {
+                print("[EagerMode] Early stopping due to logprob threshold")
+                return false
+            }
+            
+            return nil
         }
         
-        // 3️⃣ Fallback: Word-level fuzzy matching
-        let priorWords = lowerContext.split(separator: " ").map(String.init)
-        let windowWords = lowerWindow.split(separator: " ").map(String.init)
-        let contextWords = Array(priorWords.suffix(150))  // More context
+        // segment callback from WhisperAX
+        whisperKit.segmentDiscoveryCallback = { segments in
+            for segment in segments {
+                print("[EagerMode] Discovered segment: \(segment.id) (\(segment.seek)): \(segment.start) -> \(segment.end)")
+            }
+        }
         
-        var bestOverlap = 0
-        var bestScore: Double = 0.0
+        print("[EagerMode] \(lastAgreedSeconds)-\(Double(samples.count) / 16000.0) seconds")
         
-        // Try different overlap lengths
-        for overlap in stride(from: min(contextWords.count, windowWords.count), through: 5, by: -1) {  // Increased from 3
-            let suffix = Array(contextWords.suffix(overlap))
-            let prefix = Array(windowWords.prefix(overlap))
+        let streamingAudio = samples
+        var streamOptions = options
+        streamOptions.clipTimestamps = [lastAgreedSeconds]
+        let lastAgreedTokens = lastAgreedWords.flatMap { $0.tokens }
+        streamOptions.prefixTokens = lastAgreedTokens
+        
+        // transcribe call
+        let transcription: TranscriptionResult? = try await whisperKit.transcribe(
+            audioArray: streamingAudio,
+            decodeOptions: streamOptions,
+            callback: decodingCallback
+        ).first
+        
+        // result processing from WhisperAX lines 677-712
+        var skipAppend = false
+        if let result = transcription {
+            hypothesisWords = result.allWords.filter { $0.start >= lastAgreedSeconds }
             
-            // Calculate ordered similarity (not just set intersection)
-            var matchCount = 0
-            var orderPenalty = 0.0
-            
-            for i in 0..<min(suffix.count, prefix.count) {
-                if suffix[i] == prefix[i] {
-                    matchCount += 1
+            if let prevResult = prevResult {
+                prevWords = prevResult.allWords.filter { $0.start >= lastAgreedSeconds }
+                let commonPrefix = TranscriptionUtilities.findLongestCommonPrefix(prevWords, hypothesisWords)
+                
+                print("[EagerMode] Prev \"\((prevWords.map { $0.word }).joined())\"")
+                print("[EagerMode] Next \"\((hypothesisWords.map { $0.word }).joined())\"")
+                print("[EagerMode] Found common prefix \"\((commonPrefix.map { $0.word }).joined())\"")
+                
+                if commonPrefix.count >= Int(tokenConfirmationsNeeded) {
+                    lastAgreedWords = Array(commonPrefix.suffix(Int(tokenConfirmationsNeeded)))
+                    lastAgreedSeconds = lastAgreedWords.first!.start
+                    print("[EagerMode] Found new last agreed word \"\(lastAgreedWords.first!.word)\" at \(lastAgreedSeconds) seconds")
+                    
+                    confirmedWords.append(contentsOf: commonPrefix.prefix(commonPrefix.count - Int(tokenConfirmationsNeeded)))
+                    let currentWords = confirmedWords.map { $0.word }.joined()
+                    print("[EagerMode] Current: \(lastAgreedSeconds) -> \(Double(samples.count) / 16000.0) \(currentWords)")
                 } else {
-                    // Check if word exists but in wrong position
-                    if prefix.contains(suffix[i]) {
-                        matchCount += 1
-                        orderPenalty += 0.4  // Increased penalty from 0.3
-                    }
+                    print("[EagerMode] Using same last agreed time \(lastAgreedSeconds)")
+                    skipAppend = true
                 }
             }
-            
-            let score = (Double(matchCount) - orderPenalty) / Double(overlap)
-            
-            // Stricter threshold: 75% instead of 70%
-            if score > 0.75 && score > bestScore {
-                bestScore = score
-                bestOverlap = overlap
-            }
+            prevResult = result
         }
         
-        // 4️⃣ Extract new part
-        if bestOverlap > 0 {
-            let originalWords = latestWindow.split(separator: " ").map(String.init)
-            var newPart = Array(originalWords.dropFirst(bestOverlap)).joined(separator: " ")
-            
-            // IMPROVED: Phrase-level duplicate check
-            let normalizedNewPart = newPart.lowercased()
-                .replacingOccurrences(of: "[,.:;!?'\"]", with: "", options: .regularExpression)
-                .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-            
-            let normalizedPrior = String(prior.suffix(200)).lowercased()
-                .replacingOccurrences(of: "[,.:;!?'\"]", with: "", options: .regularExpression)
-                .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-            
-            // Check 5-word phrases
-            let newPartWords = normalizedNewPart.split(separator: " ")
-            if newPartWords.count >= 5 {
-                for i in 0...(newPartWords.count - 5) {
-                    let phrase = newPartWords[i..<(i+5)].joined(separator: " ")
-                    if normalizedPrior.contains(phrase) {
-                        let wordsToKeep = Array(newPartWords.dropFirst(i + 5))
-                        newPart = wordsToKeep.joined(separator: " ")
-                        if newPart.isEmpty {
-                            return ""
-                        }
-                        break
-                    }
-                }
-            }
-            
-            return newPart.trimmingCharacters(in: .whitespaces)
+        if !skipAppend {
+            eagerResults.append(transcription)
         }
         
-        // 5️⃣ No overlap found - check word-level similarity
-        let windowSet = Set(windowWords)
-        let priorSet = Set(priorWords)
-        let commonWords = windowSet.intersection(priorSet)
+        // final text assembly from WhisperAX lines 715-727
+        let finalWords = confirmedWords.map { $0.word }.joined()
+        confirmedText = finalWords
         
-        // Stricter: 70% instead of 60%
-        if !commonWords.isEmpty && Double(commonWords.count) / Double(windowWords.count) > 0.7 {
-            return ""  // Skip repetition
+        // Accept the final hypothesis because it is the last of the available audio
+        let lastHypothesis = lastAgreedWords + TranscriptionUtilities.findLongestDifferentSuffix(prevWords, hypothesisWords)
+        hypothesisText = lastHypothesis.map { $0.word }.joined()
+        
+        // Update callbacks
+        let combinedText = confirmedText + hypothesisText
+        onLiveUpdate(combinedText, confirmedText)
+        
+        // Update metrics
+        if let result = transcription {
+            tokensPerSecond = result.timings.tokensPerSecond
+            firstTokenTime = result.timings.firstTokenTime
+            let totalAudio = Double(samples.count) / 16000.0
+            let totalInferenceTime = result.timings.fullPipeline
+            effectiveRealTimeFactor = totalInferenceTime / totalAudio
         }
-        
-        // Otherwise return full window (new content)
-        return latestWindow
     }
     
-    // Detect silence by checking if audio amplitude is below threshold
     private func detectSilence(in samples: [Float]) -> Bool {
         guard !samples.isEmpty else { return true }
         
-        // Calculate RMS (Root Mean Square) amplitude
-        var sumSquares: Float = 0
-        vDSP_svesq(samples, 1, &sumSquares, vDSP_Length(samples.count))
-        let rms = sqrt(sumSquares / Float(samples.count))
+        let recentSampleCount = Int(inputSampleRate * 0.5)
+        let recentSamples = Array(samples.suffix(recentSampleCount))
         
-        return rms < silenceThreshold
+        var sumSquares: Float = 0
+        vDSP_svesq(recentSamples, 1, &sumSquares, vDSP_Length(recentSamples.count))
+        let rms = sqrt(sumSquares / Float(recentSamples.count))
+        
+        return rms < Float(silenceThreshold)
     }
 }
