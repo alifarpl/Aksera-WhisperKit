@@ -339,7 +339,7 @@ struct BubbleView: View {
     }
 }
 
-// MARK: - Live Bubble View (Shows real-time transcription)
+// MARK: - Live Bubble View (Shows real-time transcription with eager mode)
 struct LiveBubbleView: View {
     let liveText: String
     let finalizedText: String
@@ -372,29 +372,26 @@ struct LiveBubbleView: View {
             }
             
             if !liveText.isEmpty {
-                VStack(alignment: .leading, spacing: 8) {
-                    // Show finalized part (confirmed text)
+                // EXACT WhisperAX eager mode display: show confirmed (bold) + hypothesis (gray) in one bubble
+                HStack(alignment: .top, spacing: 0) {
+                    // Confirmed text (stable, bold, primary color)
                     if !finalizedText.isEmpty {
                         Text(finalizedText)
-                            .padding(12)
-                            .background(Color.green.opacity(0.15))
-                            .cornerRadius(12)
+                            .fontWeight(.bold)
+                            .foregroundColor(.primary)
                     }
                     
-                    // Show live/unfinalized part (text still being processed)
-                    let unfinalizedText = String(liveText.dropFirst(finalizedText.count))
-                    if !unfinalizedText.isEmpty {
-                        Text(unfinalizedText)
-                            .padding(12)
-                            .background(Color.orange.opacity(0.15))
-                            .cornerRadius(12)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 12)
-                                    .stroke(Color.orange.opacity(0.3), lineWidth: 1)
-                                    .animation(.easeInOut(duration: 0.5).repeatForever(), value: liveText.count)
-                            )
+                    // Hypothesis text (tentative, gray, italic)
+                    let hypothesisText = String(liveText.dropFirst(finalizedText.count))
+                    if !hypothesisText.isEmpty {
+                        Text(hypothesisText)
+                            .foregroundColor(.gray)
                     }
                 }
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.blue.opacity(0.15))
+                .cornerRadius(12)
             } else {
                 Text("Listening...")
                     .italic()
