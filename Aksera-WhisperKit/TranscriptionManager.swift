@@ -253,12 +253,18 @@ actor TranscriptionManager {
             let hasSpokenBefore = !confirmedText.isEmpty || !prevWords.isEmpty
             if silenceDuration >= silenceDurationForSplit && hasSpokenBefore && !silenceDetected  {
                 print("[TranscriptionManager] Long silence detected (\(silenceDuration)s), creating new bubble")
-                silenceDetected = true
-                onSilenceDetected()
                 // After onSilenceDetected()
                 silenceDetected = true
                 onSilenceDetected()
-
+                
+                // ✅ Finalize current hypothesis
+                if !hypothesisText.isEmpty {
+                    confirmedText += hypothesisText
+                    hypothesisText = ""
+                    onLiveUpdate(confirmedText, confirmedText)
+                    print("[TranscriptionManager] ✅ Finalized hypothesis before reset: \(confirmedText)")
+                }
+                
                 Task {
                     try? await Task.sleep(nanoseconds: 500_000_000)
                     whisperKit.audioProcessor.stopRecording()
@@ -267,12 +273,16 @@ actor TranscriptionManager {
                         guard let self else { return }
                         Task { await self.updateBufferState() }
                     }
+                    
+                    // Clear prefix tokens and reset state
+                    self.lastAgreedWords = []
+                    self.lastAgreedSeconds = 0.0
                     self.reset()
                     self.lastSpeechTime = Date()
                     print("[TranscriptionManager] ✅ Reset complete, ready for new audio")
                 }
                 
-                reset()
+//                reset()
             }
             
             try await Task.sleep(nanoseconds: 100_000_000)
