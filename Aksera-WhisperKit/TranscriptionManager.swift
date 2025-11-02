@@ -34,6 +34,18 @@ actor TranscriptionManager {
     private var tickingTask: Task<Void, Never>?
     private var isTranscribing = false
     
+    // For text stability detection
+    private var recentHypotheses: [String] = []
+
+    // Determines if hypothesis has remained unchanged for several loops
+    private func isTextStable() -> Bool {
+        guard recentHypotheses.count >= 3 else { return false }
+        let lastThree = recentHypotheses.suffix(3)
+        // If all last 3 hypotheses are identical, it's stable
+        let unique = Set(lastThree)
+        return unique.count == 1
+    }
+    
     // EXACT WhisperAX eager mode properties
     private var eagerResults: [TranscriptionResult?] = []
     private var prevResult: TranscriptionResult?
@@ -247,14 +259,58 @@ actor TranscriptionManager {
             // Check for long silence to create new bubble
             let silenceDuration = Date().timeIntervalSince(lastSpeechTime)
             
+            // After 0.5s of silence, move hypothesis to confirmed
+            if !hypothesisText.isEmpty && silenceDuration >= 0.5 {
+                print("[TranscriptionManager] ⏰ Finalizing lingering hypothesis after short silence")
+
+                // Promote hypothesis words to confirmed
+                confirmedText += hypothesisText
+                confirmedWords.append(contentsOf: hypothesisWords)
+
+                // Advance baseline to end of last confirmed/hypothesis word
+                let newBoundary = hypothesisWords.last?.end ?? confirmedWords.last?.end
+                if let boundary = newBoundary {
+                    lastAgreedSeconds = boundary
+                    print("[TranscriptionManager] 🔒 Advanced lastAgreedSeconds → \(lastAgreedSeconds)s after finalizing hypothesis")
+                }
+                
+                // Reset agreement baseline so WhisperKit doesn’t re-append old suffix
+                prevWords = []
+                lastAgreedWords = []
+                hypothesisWords = []
+                hypothesisText = ""
+
+                onLiveUpdate(confirmedText, confirmedText)
+            }
+            
+            else if isTextStable() && !hypothesisText.isEmpty {
+                print("[TranscriptionManager] 🧩 Hypothesis stable, finalizing even without silence")
+
+                confirmedText += hypothesisText
+                confirmedWords.append(contentsOf: hypothesisWords)
+
+                let newBoundary = hypothesisWords.last?.end ?? confirmedWords.last?.end
+                if let boundary = newBoundary {
+                    lastAgreedSeconds = boundary
+                    print("[TranscriptionManager] 🔒 Advanced lastAgreedSeconds → \(lastAgreedSeconds)s after stable text finalization")
+                }
+
+                hypothesisWords = []
+                hypothesisText = ""
+                recentHypotheses.removeAll()
+
+                onLiveUpdate(confirmedText, confirmedText)
+            }
+            
             // Check if we have ANY text (confirmed OR hypothesis)
             let hasAnyText = !confirmedText.isEmpty || !hypothesisText.isEmpty
             
-            let hasSpokenBefore = !confirmedText.isEmpty || !prevWords.isEmpty
-            if silenceDuration >= silenceDurationForSplit && hasSpokenBefore && !silenceDetected  {
+            //let hasSpokenBefore = !confirmedText.isEmpty || !prevWords.isEmpty
+            if silenceDuration >= silenceDurationForSplit && hasAnyText && !silenceDetected  {
                 print("[TranscriptionManager] Long silence detected (\(silenceDuration)s), creating new bubble")
-                // After onSilenceDetected()
                 silenceDetected = true
+                
+                // Trigger bubble creation
                 onSilenceDetected()
                 
                 // ✅ Finalize current hypothesis
@@ -265,24 +321,27 @@ actor TranscriptionManager {
                     print("[TranscriptionManager] ✅ Finalized hypothesis before reset: \(confirmedText)")
                 }
                 
-                Task {
-                    try? await Task.sleep(nanoseconds: 500_000_000)
-                    whisperKit.audioProcessor.stopRecording()
-                    whisperKit.audioProcessor = AudioProcessor()
-                    try? whisperKit.audioProcessor.startRecordingLive(inputDeviceID: nil) { [weak self] _ in
-                        guard let self else { return }
-                        Task { await self.updateBufferState() }
-                    }
+                // Task {
+                whisperKit.audioProcessor.stopRecording()
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                whisperKit.audioProcessor = AudioProcessor()
+                try? whisperKit.audioProcessor.startRecordingLive(inputDeviceID: nil) { [weak self] _ in
+                    guard let self else { return }
+                    Task { await self.updateBufferState() }
+                 //   }
                     
                     // Clear prefix tokens and reset state
-                    self.lastAgreedWords = []
-                    self.lastAgreedSeconds = 0.0
-                    self.reset()
-                    self.lastSpeechTime = Date()
-                    print("[TranscriptionManager] ✅ Reset complete, ready for new audio")
+//                    self.lastAgreedWords = []
+//                    self.lastAgreedSeconds = 0.0
+//                    self.reset()
+//                    self.lastSpeechTime = Date()
+//                    print("[TranscriptionManager] ✅ Reset complete, ready for new audio")
                 }
                 
-//                reset()
+                reset()
+                print("[TranscriptionManager] ✅ Reset complete, ready for new audio")
+                return
+
             }
             
             try await Task.sleep(nanoseconds: 100_000_000)
@@ -420,6 +479,12 @@ actor TranscriptionManager {
         
         let lastHypothesis = lastAgreedWords + TranscriptionUtilities.findLongestDifferentSuffix(prevWords, hypothesisWords)
         hypothesisText = lastHypothesis.map { $0.word }.joined()
+        
+        // Track hypothesis history for stability checks
+        recentHypotheses.append(hypothesisText)
+        if recentHypotheses.count > 5 {
+            recentHypotheses.removeFirst()
+        }
         
         print("[EagerMode] Confirmed: '\(confirmedText)' | Hypothesis: '\(hypothesisText)'")
         
