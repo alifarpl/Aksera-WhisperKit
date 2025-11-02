@@ -267,12 +267,9 @@ actor TranscriptionManager {
                 confirmedText += hypothesisText
                 confirmedWords.append(contentsOf: hypothesisWords)
 
-                // Advance baseline to end of last confirmed/hypothesis word
-                let newBoundary = hypothesisWords.last?.end ?? confirmedWords.last?.end
-                if let boundary = newBoundary {
-                    lastAgreedSeconds = boundary
-                    print("[TranscriptionManager] 🔒 Advanced lastAgreedSeconds → \(lastAgreedSeconds)s after finalizing hypothesis")
-                }
+                // Advance baseline beyond finalized text
+                lastAgreedSeconds = Float(hypothesisWords.last?.end ?? confirmedWords.last?.end ?? 0.0)
+                print("[TranscriptionManager] 🔒 Advanced lastAgreedSeconds → \(lastAgreedSeconds)s after finalizing hypothesis")
                 
                 // Reset agreement baseline so WhisperKit doesn’t re-append old suffix
                 prevWords = []
@@ -281,6 +278,19 @@ actor TranscriptionManager {
                 hypothesisText = ""
 
                 onLiveUpdate(confirmedText, confirmedText)
+            }
+            
+            // ✅ Light buffer reset after short silence to avoid re-decoding old data
+            if silenceDuration >= 0.5 {
+                whisperKit.audioProcessor.stopRecording()
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                whisperKit.audioProcessor = AudioProcessor()
+                try? whisperKit.audioProcessor.startRecordingLive(inputDeviceID: nil) { [weak self] _ in
+                    guard let self else { return }
+                    Task { await self.updateBufferState() }
+                }
+
+                print("[TranscriptionManager] 🧹 Flushed old audio buffer after silence, ready for next speech")
             }
             
             else if isTextStable() && !hypothesisText.isEmpty {
@@ -424,6 +434,16 @@ actor TranscriptionManager {
         print("[EagerMode] Transcribing \(lastAgreedSeconds)-\(Double(samples.count) / 16000.0) seconds")
         
         let streamingAudio = samples
+        
+        // Calculate the real audio length in seconds
+        let audioDuration = Double(samples.count) / 16000.0
+
+        // ✅ Safety: only skip if buffer hasn't grown
+        if Float(audioDuration) - lastAgreedSeconds < 0.2 {
+            print("[EagerMode] 💤 No new audio to transcribe — skipping this loop")
+            return
+        }
+        
         var streamOptions = options
         streamOptions.clipTimestamps = [lastAgreedSeconds]
         let lastAgreedTokens = lastAgreedWords.flatMap { $0.tokens }
