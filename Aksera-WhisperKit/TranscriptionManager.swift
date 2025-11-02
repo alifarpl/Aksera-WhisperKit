@@ -175,6 +175,8 @@ actor TranscriptionManager {
         // Stop WhisperKit's audio processor
         whisperKit?.audioProcessor.stopRecording()
         
+        reset()
+        
         print("[TranscriptionManager] Stopped")
     }
     
@@ -238,9 +240,9 @@ actor TranscriptionManager {
         
         guard voiceDetected else {
             print("[TranscriptionManager] No voice detected, waiting...")
-            if currentText.isEmpty {
-                    currentText = "Waiting for speech..."
-            }
+//            if currentText.isEmpty {
+//                    currentText = "Waiting for speech..."
+//            }
             
             // Check for long silence to create new bubble
             let silenceDuration = Date().timeIntervalSince(lastSpeechTime)
@@ -248,10 +250,28 @@ actor TranscriptionManager {
             // Check if we have ANY text (confirmed OR hypothesis)
             let hasAnyText = !confirmedText.isEmpty || !hypothesisText.isEmpty
             
-            if silenceDuration >= silenceDurationForSplit && hasAnyText && !silenceDetected {
+            let hasSpokenBefore = !confirmedText.isEmpty || !prevWords.isEmpty
+            if silenceDuration >= silenceDurationForSplit && hasSpokenBefore && !silenceDetected  {
                 print("[TranscriptionManager] Long silence detected (\(silenceDuration)s), creating new bubble")
                 silenceDetected = true
                 onSilenceDetected()
+                // After onSilenceDetected()
+                silenceDetected = true
+                onSilenceDetected()
+
+                Task {
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    whisperKit.audioProcessor.stopRecording()
+                    whisperKit.audioProcessor = AudioProcessor()
+                    try? whisperKit.audioProcessor.startRecordingLive(inputDeviceID: nil) { [weak self] _ in
+                        guard let self else { return }
+                        Task { await self.updateBufferState() }
+                    }
+                    self.reset()
+                    self.lastSpeechTime = Date()
+                    print("[TranscriptionManager] ✅ Reset complete, ready for new audio")
+                }
+                
                 reset()
             }
             
