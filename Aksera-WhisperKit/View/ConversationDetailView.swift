@@ -190,9 +190,12 @@ struct ConversationDetailView: View {
                 Task { @MainActor in
                     guard let context = context else { return }
                     
+                    // Save combined text (confirmed + hypothesis)
+                    let textToSave = self.currentLiveText
+                    
                     // Only save if we have text and we're still on the SAME conversation
-                    if !self.currentLiveText.isEmpty && self.conversation.id == conversationID {
-                        let trimmedText = self.currentLiveText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !textToSave.isEmpty && self.conversation.id == conversationID {
+                        let trimmedText = textToSave.trimmingCharacters(in: .whitespacesAndNewlines)
                         guard !trimmedText.isEmpty else { return }
                         
                         // Create and save bubble directly in closure
@@ -208,6 +211,7 @@ struct ConversationDetailView: View {
                         
                         do {
                             try context.save()
+                            print("✅ Bubble saved: \(trimmedText)")
                         } catch {
                             print("Error saving bubble: \(error)")
                         }
@@ -354,7 +358,6 @@ struct LiveBubbleView: View {
                     .font(.caption2)
                     .foregroundStyle(.orange)
                 
-                // Animated dots to show it's live
                 HStack(spacing: 2) {
                     ForEach(0..<3) { index in
                         Circle()
@@ -372,24 +375,19 @@ struct LiveBubbleView: View {
             }
             
             if !liveText.isEmpty {
-                // EXACT WhisperAX eager mode display: show confirmed (bold) + hypothesis (gray) in one bubble
                 HStack(alignment: .top, spacing: 0) {
-                    // Confirmed text (stable, bold, primary color)
-                    if !finalizedText.isEmpty {
-                        Text(finalizedText)
-                            .fontWeight(.bold)
-                            .foregroundColor(.primary)
-                    }
+                    Text(finalizedText)
+                        .fontWeight(.bold)
+                        .foregroundColor(.primary)
                     
-                    // Hypothesis text (tentative, gray, italic)
-                    let hypothesisText = String(liveText.dropFirst(finalizedText.count))
-                    if !hypothesisText.isEmpty {
-                        Text(hypothesisText)
-                            .foregroundColor(.gray)
-                    }
+                    Text(String(liveText.dropFirst(finalizedText.count)))
+                        .fontWeight(.bold)
+                        .foregroundColor(.gray)
                 }
-                .padding(12)
+                .font(.headline)
+                .multilineTextAlignment(.leading)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(12)
                 .background(Color.blue.opacity(0.15))
                 .cornerRadius(12)
             } else {

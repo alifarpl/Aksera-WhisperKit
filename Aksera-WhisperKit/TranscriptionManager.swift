@@ -10,59 +10,9 @@ import AVFoundation
 import WhisperKit
 import Accelerate
 
-// MARK: - Audio Ring Buffer
-final class AudioRingBuffer {
-    private let queue = DispatchQueue(label: "AudioRingBuffer.queue")
-    private var samples: [Float] = []
-    private var maxSamples: Int
-    private(set) var sampleRate: Double
-    
-    init(sampleRate: Double, maxSeconds: Double) {
-        self.sampleRate = sampleRate
-        self.maxSamples = Int(sampleRate * maxSeconds)
-        self.samples.reserveCapacity(self.maxSamples)
-    }
-    
-    func append(buffer: AVAudioPCMBuffer) {
-        guard let channelData = buffer.floatChannelData else { return }
-        let channelCount = Int(buffer.format.channelCount)
-        let frameCount = Int(buffer.frameLength)
-        if frameCount == 0 { return }
-        
-        var mixed = [Float](repeating: 0, count: frameCount)
-        if channelCount == 1 {
-            mixed.withUnsafeMutableBufferPointer { dest in
-                dest.baseAddress!.update(from: channelData[0], count: frameCount)
-            }
-        } else {
-            for ch in 0..<channelCount {
-                let src = channelData[ch]
-                vDSP_vadd(mixed, 1, src, 1, &mixed, 1, vDSP_Length(frameCount))
-            }
-            var divisor = Float(channelCount)
-            vDSP_vsdiv(mixed, 1, &divisor, &mixed, 1, vDSP_Length(frameCount))
-        }
-        
-        queue.sync {
-            samples.append(contentsOf: mixed)
-            if samples.count > maxSamples {
-                samples.removeFirst(samples.count - maxSamples)
-            }
-        }
-    }
-    
-    func allSamples() -> [Float] {
-        return queue.sync { samples }
-    }
-    
-    func sampleCount() -> Int {
-        return queue.sync { samples.count }
-    }
-}
-
-// MARK: - Transcription Manager - WhisperAX Implementation
+// MARK: - Transcription Manager - TRUE WhisperAX Implementation
 actor TranscriptionManager {
-    // WhisperAX @AppStorage equivalents
+    // EXACT WhisperAX @AppStorage equivalents
     private let selectedTask: String = "transcribe"
     private let selectedLanguage: String = "english"
     private let enableTimestamps: Bool = true
@@ -74,13 +24,9 @@ actor TranscriptionManager {
     private let compressionCheckWindow: Double = 60
     private let sampleLength: Double = 224
     private let tokenConfirmationsNeeded: Double = 2
+    private let realtimeDelayInterval: Double = 1.0
     
-    // Audio
-    private let engine = AVAudioEngine()
-    private var ring: AudioRingBuffer?
-    private var inputSampleRate: Double = 16000
-    
-    // WhisperKit
+    // WhisperKit - EXACT like WhisperAX
     private var whisperKit: WhisperKit?
     
     // State
@@ -88,7 +34,7 @@ actor TranscriptionManager {
     private var tickingTask: Task<Void, Never>?
     private var isTranscribing = false
     
-    // WhisperAX eager mode properties
+    // EXACT WhisperAX eager mode properties
     private var eagerResults: [TranscriptionResult?] = []
     private var prevResult: TranscriptionResult?
     private var lastAgreedSeconds: Float = 0.0
@@ -104,16 +50,20 @@ actor TranscriptionManager {
     private var currentFallbacks: Int = 0
     private var currentDecodingLoops: Int = 0
     
-    // Performance metrics (optional)
+    // Performance metrics
     private var tokensPerSecond: TimeInterval = 0
     private var firstTokenTime: TimeInterval = 0
     private var effectiveRealTimeFactor: TimeInterval = 0
     
     // Silence detection for bubble creation
-    private let silenceThreshold: Double = 0.3
+    private let silenceThreshold: Double = 0.3  // EXACT WhisperAX value
     private let silenceDurationForSplit: Double = 1.5
     private var lastSpeechTime: Date = Date()
     private var silenceDetected: Bool = false
+    
+    // Audio state tracking (like WhisperAX bufferEnergy/bufferSeconds)
+    private var bufferEnergy: [Float] = []
+    private var bufferSeconds: Double = 0
     
     // Callbacks
     private let onLiveUpdate: (String, String) -> Void
@@ -132,7 +82,8 @@ actor TranscriptionManager {
     
     func start() async throws {
         guard !running else { return }
-        running = true
+        
+        print("[TranscriptionManager] Starting...")
         
         // WhisperKit initialization from WhisperAX
         let config = WhisperKitConfig(
@@ -148,44 +99,70 @@ actor TranscriptionManager {
             download: true
         )
         
+        print("[TranscriptionManager] Initializing WhisperKit...")
         self.whisperKit = try await WhisperKit(config)
+        print("[TranscriptionManager] WhisperKit initialized successfully")
         
         guard whisperKit?.textDecoder.supportsWordTimestamps == true else {
             throw NSError(
                 domain: "TranscriptionManager",
                 code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "Eager mode requires word timestamps, which are not supported by the current model"]
+                userInfo: [NSLocalizedDescriptionKey: "Eager mode requires word timestamps"]
             )
         }
         
-        // Setup audio engine
-        let input = engine.inputNode
-        let format = input.inputFormat(forBus: 0)
-        self.inputSampleRate = format.sampleRate
-        self.ring = AudioRingBuffer(sampleRate: inputSampleRate, maxSeconds: 30)
+        print("[TranscriptionManager] Word timestamps supported ✓")
         
-        input.removeTap(onBus: 0)
-        input.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
+        // CRITICAL: Initialize WhisperKit's AudioProcessor (WhisperAX pattern)
+        whisperKit?.audioProcessor = AudioProcessor()
+        
+        guard let audioProcessor = whisperKit?.audioProcessor else {
+            throw NSError(domain: "TranscriptionManager", code: 2,
+                         userInfo: [NSLocalizedDescriptionKey: "Failed to initialize AudioProcessor"])
+        }
+        
+        // Request microphone permission
+        guard await AudioProcessor.requestRecordPermission() else {
+            throw NSError(domain: "TranscriptionManager", code: 3,
+                         userInfo: [NSLocalizedDescriptionKey: "Microphone access denied"])
+        }
+        
+        // WhisperAX audio recording start (lines ~620-630)
+        #if os(macOS)
+        var deviceId: DeviceID? = nil
+        // On macOS, you might want to allow device selection
+        // For now, use default device (nil)
+        #else
+        let deviceId: DeviceID? = nil
+        #endif
+        
+        // Start recording with WhisperKit's AudioProcessor
+        try audioProcessor.startRecordingLive(inputDeviceID: deviceId) { [weak self] _ in
             guard let self else { return }
-            Task { [weak self] in
-                guard let self else { return }
-                await self.ring?.append(buffer: buffer)
+            Task { @MainActor in
+                // Update buffer state (WhisperAX pattern)
+                await self.updateBufferState()
             }
         }
         
-        try engine.start()
+        print("[TranscriptionManager] Audio recording started")
         
-        // Start transcription loop
+        running = true
+        
+        // WhisperAX transcription loop (lines ~551-561)
         tickingTask = Task { [weak self] in
             guard let self else { return }
             while await self.running {
-                try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 second (realtimeDelayInterval)
-                await self.tick()
+                try? await Task.sleep(nanoseconds: UInt64(await self.realtimeDelayInterval * 1_000_000_000))
+                await self.realtimeLoop()
             }
         }
+        
+        print("[TranscriptionManager] Transcription loop started")
     }
     
     func stop() async {
+        print("[TranscriptionManager] Stopping...")
         running = false
         
         while isTranscribing {
@@ -194,12 +171,16 @@ actor TranscriptionManager {
         
         tickingTask?.cancel()
         tickingTask = nil
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
+        
+        // Stop WhisperKit's audio processor
+        whisperKit?.audioProcessor.stopRecording()
+        
+        print("[TranscriptionManager] Stopped")
     }
     
     func reset() {
-        // WhisperAX reset
+        print("[TranscriptionManager] Resetting state")
+        // WhisperAX resetState() from lines ~281-314
         eagerResults = []
         prevResult = nil
         lastAgreedSeconds = 0.0
@@ -214,44 +195,83 @@ actor TranscriptionManager {
         currentDecodingLoops = 0
         lastSpeechTime = Date()
         silenceDetected = false
+        bufferEnergy = []
+        bufferSeconds = 0
     }
     
-    private func tick() async {
-        guard running, !isTranscribing, let whisperKit, let ring else { return }
-        isTranscribing = true
-        defer { isTranscribing = false }
+    // Update buffer state from AudioProcessor (WhisperAX pattern)
+    private func updateBufferState() {
+        bufferEnergy = whisperKit?.audioProcessor.relativeEnergy ?? []
+        bufferSeconds = Double(whisperKit?.audioProcessor.audioSamples.count ?? 0) / Double(WhisperKit.sampleRate)
+    }
+    
+    // WhisperAX realtimeLoop() from lines ~547-561
+    private func realtimeLoop() async {
+        guard running, !isTranscribing else { return }
         
-        let samples = ring.allSamples()
-        guard !samples.isEmpty else { return }
-        
-        // Silence detection
-        let isSilent = detectSilence(in: samples)
-        if isSilent {
-            let silenceDuration = Date().timeIntervalSince(lastSpeechTime)
-            if silenceDuration >= silenceDurationForSplit && !confirmedText.isEmpty && !silenceDetected {
-                silenceDetected = true
-                onSilenceDetected()
-                reset()
-                return
-            }
-            return
-        } else {
-            lastSpeechTime = Date()
-            silenceDetected = false
-        }
-        
-        // Transcribe
         do {
-            try await transcribeEagerMode(samples: samples, whisperKit: whisperKit)
-        } catch is CancellationError {
-            return
+            try await transcribeCurrentBuffer()
         } catch {
+            print("[TranscriptionManager] Error: \(error.localizedDescription)")
             onError(error)
         }
     }
     
+    // WhisperAX transcribeCurrentBuffer() from lines ~563-640
+    private func transcribeCurrentBuffer() async throws {
+        guard let whisperKit = whisperKit else { return }
+        
+        isTranscribing = true
+        defer { isTranscribing = false }
+        
+        // Get current audio buffer from WhisperKit's AudioProcessor
+        let currentBuffer = whisperKit.audioProcessor.audioSamples
+        
+        print("[TranscriptionManager] Buffer size: \(currentBuffer.count) samples (\(Double(currentBuffer.count)/16000.0)s)")
+        
+        // Check for silence using WhisperAX's method
+        let voiceDetected = AudioProcessor.isVoiceDetected(
+            in: whisperKit.audioProcessor.relativeEnergy,
+            nextBufferInSeconds: Float(bufferSeconds),
+            silenceThreshold: Float(silenceThreshold)
+        )
+        
+        guard voiceDetected else {
+            print("[TranscriptionManager] No voice detected, waiting...")
+            if currentText.isEmpty {
+                    currentText = "Waiting for speech..."
+            }
+            
+            // Check for long silence to create new bubble
+            let silenceDuration = Date().timeIntervalSince(lastSpeechTime)
+            
+            // Check if we have ANY text (confirmed OR hypothesis)
+            let hasAnyText = !confirmedText.isEmpty || !hypothesisText.isEmpty
+            
+            if silenceDuration >= silenceDurationForSplit && hasAnyText && !silenceDetected {
+                print("[TranscriptionManager] Long silence detected (\(silenceDuration)s), creating new bubble")
+                silenceDetected = true
+                onSilenceDetected()
+                reset()
+            }
+            
+            try await Task.sleep(nanoseconds: 100_000_000)
+            return
+        }
+        
+        lastSpeechTime = Date()
+        silenceDetected = false
+        
+        print("[TranscriptionManager] Voice detected, transcribing...")
+        
+        // Transcribe using eager mode
+        try await transcribeEagerMode(samples: Array(currentBuffer), whisperKit: whisperKit)
+    }
+    
     // transcribeEagerMode from WhisperAX ContentView.swift lines 642-731
     private func transcribeEagerMode(samples: [Float], whisperKit: WhisperKit) async throws {
+        print("[EagerMode] Starting transcription")
+        
         let languageCode = Constants.languages[selectedLanguage, default: Constants.defaultLanguageCode]
         let task: DecodingTask = selectedTask == "transcribe" ? .transcribe : .translate
         
@@ -271,7 +291,7 @@ actor TranscriptionManager {
             chunkingStrategy: .none
         )
         
-        // early stopping checks from WhisperAX lines 586-615
+        // early stopping checks from WhisperAX
         let decodingCallback: ((TranscriptionProgress) -> Bool?) = { progress in
             DispatchQueue.main.async {
                 let fallbacks = Int(progress.timings.totalDecodingFallbacks)
@@ -306,14 +326,13 @@ actor TranscriptionManager {
             return nil
         }
         
-        // segment callback from WhisperAX
         whisperKit.segmentDiscoveryCallback = { segments in
             for segment in segments {
-                print("[EagerMode] Discovered segment: \(segment.id) (\(segment.seek)): \(segment.start) -> \(segment.end)")
+                print("[EagerMode] Discovered segment: \(segment.id): \(segment.start)->\(segment.end)")
             }
         }
         
-        print("[EagerMode] \(lastAgreedSeconds)-\(Double(samples.count) / 16000.0) seconds")
+        print("[EagerMode] Transcribing \(lastAgreedSeconds)-\(Double(samples.count) / 16000.0) seconds")
         
         let streamingAudio = samples
         var streamOptions = options
@@ -321,14 +340,16 @@ actor TranscriptionManager {
         let lastAgreedTokens = lastAgreedWords.flatMap { $0.tokens }
         streamOptions.prefixTokens = lastAgreedTokens
         
-        // transcribe call
+        print("[EagerMode] Calling transcribe...")
         let transcription: TranscriptionResult? = try await whisperKit.transcribe(
             audioArray: streamingAudio,
             decodeOptions: streamOptions,
             callback: decodingCallback
         ).first
         
-        // result processing from WhisperAX lines 677-712
+        print("[EagerMode] Transcription complete")
+        
+        // result processing from WhisperAX
         var skipAppend = false
         if let result = transcription {
             hypothesisWords = result.allWords.filter { $0.start >= lastAgreedSeconds }
@@ -337,37 +358,40 @@ actor TranscriptionManager {
                 prevWords = prevResult.allWords.filter { $0.start >= lastAgreedSeconds }
                 let commonPrefix = TranscriptionUtilities.findLongestCommonPrefix(prevWords, hypothesisWords)
                 
-                print("[EagerMode] Prev \"\((prevWords.map { $0.word }).joined())\"")
-                print("[EagerMode] Next \"\((hypothesisWords.map { $0.word }).joined())\"")
-                print("[EagerMode] Found common prefix \"\((commonPrefix.map { $0.word }).joined())\"")
+                print("[EagerMode] Prev: \"\((prevWords.map { $0.word }).joined())\"")
+                print("[EagerMode] Next: \"\((hypothesisWords.map { $0.word }).joined())\"")
+                print("[EagerMode] Common prefix: \"\((commonPrefix.map { $0.word }).joined())\"")
                 
                 if commonPrefix.count >= Int(tokenConfirmationsNeeded) {
                     lastAgreedWords = Array(commonPrefix.suffix(Int(tokenConfirmationsNeeded)))
                     lastAgreedSeconds = lastAgreedWords.first!.start
-                    print("[EagerMode] Found new last agreed word \"\(lastAgreedWords.first!.word)\" at \(lastAgreedSeconds) seconds")
+                    print("[EagerMode] New last agreed word: \"\(lastAgreedWords.first!.word)\" at \(lastAgreedSeconds)s")
                     
                     confirmedWords.append(contentsOf: commonPrefix.prefix(commonPrefix.count - Int(tokenConfirmationsNeeded)))
                     let currentWords = confirmedWords.map { $0.word }.joined()
-                    print("[EagerMode] Current: \(lastAgreedSeconds) -> \(Double(samples.count) / 16000.0) \(currentWords)")
+                    print("[EagerMode] Current confirmed: \(currentWords)")
                 } else {
                     print("[EagerMode] Using same last agreed time \(lastAgreedSeconds)")
                     skipAppend = true
                 }
             }
             prevResult = result
+        } else {
+            print("[EagerMode] No transcription result")
         }
         
         if !skipAppend {
             eagerResults.append(transcription)
         }
         
-        // final text assembly from WhisperAX lines 715-727
+        // final text assembly from WhisperAX
         let finalWords = confirmedWords.map { $0.word }.joined()
         confirmedText = finalWords
         
-        // Accept the final hypothesis because it is the last of the available audio
         let lastHypothesis = lastAgreedWords + TranscriptionUtilities.findLongestDifferentSuffix(prevWords, hypothesisWords)
         hypothesisText = lastHypothesis.map { $0.word }.joined()
+        
+        print("[EagerMode] Confirmed: '\(confirmedText)' | Hypothesis: '\(hypothesisText)'")
         
         // Update callbacks
         let combinedText = confirmedText + hypothesisText
@@ -381,18 +405,5 @@ actor TranscriptionManager {
             let totalInferenceTime = result.timings.fullPipeline
             effectiveRealTimeFactor = totalInferenceTime / totalAudio
         }
-    }
-    
-    private func detectSilence(in samples: [Float]) -> Bool {
-        guard !samples.isEmpty else { return true }
-        
-        let recentSampleCount = Int(inputSampleRate * 0.5)
-        let recentSamples = Array(samples.suffix(recentSampleCount))
-        
-        var sumSquares: Float = 0
-        vDSP_svesq(recentSamples, 1, &sumSquares, vDSP_Length(recentSamples.count))
-        let rms = sqrt(sumSquares / Float(recentSamples.count))
-        
-        return rms < Float(silenceThreshold)
     }
 }
