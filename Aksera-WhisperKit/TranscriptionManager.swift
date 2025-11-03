@@ -24,7 +24,7 @@ actor TranscriptionManager {
     private let compressionCheckWindow: Double = 60
     private let sampleLength: Double = 224
     private let tokenConfirmationsNeeded: Double = 2
-    private let realtimeDelayInterval: Double = 1.0
+    private let realtimeDelayInterval: Double = 0.5
     
     // WhisperKit - like WhisperAX
     private var whisperKit: WhisperKit?
@@ -39,8 +39,8 @@ actor TranscriptionManager {
 
     // Determines if hypothesis has remained unchanged for several loops
     private func isTextStable() -> Bool {
-        guard recentHypotheses.count >= 3 else { return false }
-        let lastThree = recentHypotheses.suffix(3)
+        guard recentHypotheses.count >= 2 else { return false }
+        let lastThree = recentHypotheses.suffix(2)
         // If all last 3 hypotheses are identical, it's stable
         let unique = Set(lastThree)
         return unique.count == 1
@@ -252,6 +252,76 @@ actor TranscriptionManager {
             silenceThreshold: Float(silenceThreshold)
         )
         
+        // CRITICAL: Also check silence duration based on time, even if voice is "detected"
+        // This handles cases where background noise makes voice detection think there's speech
+        let silenceDuration = Date().timeIntervalSince(lastSpeechTime)
+        let hasAnyText = !confirmedText.isEmpty || !hypothesisText.isEmpty
+        
+        // If we have long silence (1.5s+) AND have text, create new bubble regardless of voice detection
+        if silenceDuration >= silenceDurationForSplit && hasAnyText && !silenceDetected {
+            print("[TranscriptionManager] 🔔 Long silence detected by TIME (\(String(format: "%.1f", silenceDuration))s), creating new bubble")
+            silenceDetected = true
+            
+            // ✅ CRITICAL: Finalize hypothesis FIRST before saving bubble
+            if !hypothesisText.isEmpty {
+                print("[TranscriptionManager] 📝 Finalizing hypothesis before bubble creation: '\(hypothesisText)'")
+                confirmedText += hypothesisText
+                confirmedWords.append(contentsOf: hypothesisWords)
+                
+                hypothesisWords = []
+                hypothesisText = ""
+            }
+            
+            // Update UI with finalized text BEFORE triggering callback
+            let finalText = confirmedText
+            print("[TranscriptionManager] ✅ Finalized text for bubble: '\(finalText)'")
+            onLiveUpdate(finalText, finalText)
+
+            // CRITICAL: Small delay to ensure UI updates before callback
+            try? await Task.sleep(nanoseconds: 50_000_000)  // 50ms
+
+            // NOW trigger bubble creation with complete finalized text
+            print("[TranscriptionManager] 💾 Triggering onSilenceDetected callback")
+            onSilenceDetected()
+
+            // Wait for bubble to be saved before resetting
+            try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
+            
+            // Reset audio buffer and prepare for next speech
+            print("[TranscriptionManager] 🔄 Resetting audio processor")
+            whisperKit.audioProcessor.stopRecording()
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            whisperKit.audioProcessor = AudioProcessor()
+            try? whisperKit.audioProcessor.startRecordingLive(inputDeviceID: nil) { [weak self] _ in
+                guard let self else { return }
+                Task { await self.updateBufferState() }
+            }
+            
+            // Reset state for new bubble
+            eagerResults = []
+            prevResult = nil
+            prevWords = []
+            lastAgreedWords = []
+            confirmedWords = []
+            confirmedText = ""
+            hypothesisWords = []
+            hypothesisText = ""
+            currentText = ""
+            currentFallbacks = 0
+            currentDecodingLoops = 0
+            lastSpeechTime = Date()
+            recentHypotheses = []
+            bufferEnergy = []
+            bufferSeconds = 0
+            bufferResetDone = false
+            
+            // Reset lastAgreedSeconds to 0 for fresh start on new bubble
+            lastAgreedSeconds = 0.0
+            
+            print("[TranscriptionManager] ✅ Reset complete, ready for new audio")
+            return
+        }
+        
         guard voiceDetected else {
             print("[TranscriptionManager] No voice detected, waiting...")
 //            if currentText.isEmpty {
@@ -308,7 +378,7 @@ actor TranscriptionManager {
                 }
             }
             
-            else if isTextStable() && !hypothesisText.isEmpty {
+            else if isTextStable() && !hypothesisText.isEmpty && silenceDuration < 0.5 {
                 print("[TranscriptionManager] 🧩 Hypothesis stable, finalizing even without silence")
 
                 confirmedText += hypothesisText
@@ -327,86 +397,122 @@ actor TranscriptionManager {
                 onLiveUpdate(confirmedText, confirmedText)
             }
             
-            // Check if we have ANY text (confirmed OR hypothesis)
-            let hasAnyText = !confirmedText.isEmpty || !hypothesisText.isEmpty
-            
-            //let hasSpokenBefore = !confirmedText.isEmpty || !prevWords.isEmpty
-            if silenceDuration >= silenceDurationForSplit && hasAnyText && !silenceDetected  {
-                print("[TranscriptionManager] Long silence detected (\(silenceDuration)s), creating new bubble")
-                silenceDetected = true
-                
-                // ✅ CRITICAL: Finalize hypothesis FIRST before saving bubble
-                if !hypothesisText.isEmpty {
-                    print("[TranscriptionManager] 📝 Finalizing hypothesis before bubble creation: '\(hypothesisText)'")
-                    confirmedText += hypothesisText
-                    confirmedWords.append(contentsOf: hypothesisWords)
-                    
-                    // Advance baseline beyond finalized text
-                    if let lastHypothesisEnd = hypothesisWords.last?.end {
-                        lastAgreedSeconds = Float(lastHypothesisEnd)
-                        print("[TranscriptionManager] 🔒 Advanced lastAgreedSeconds → \(lastAgreedSeconds)s")
-                    }
-                    
-                    hypothesisWords = []
-                    hypothesisText = ""
-                }
-                
-                // Update UI with finalized text BEFORE triggering callback
-                let finalText = confirmedText
-                onLiveUpdate(finalText, finalText)
-                print("[TranscriptionManager] ✅ Finalized text for bubble: '\(finalText)'")
-                
-                // NOW trigger bubble creation with complete finalized text
-                onSilenceDetected()
-                
-                // Reset audio buffer and prepare for next speech
-                whisperKit.audioProcessor.stopRecording()
-                try? await Task.sleep(nanoseconds: 200_000_000)
-                whisperKit.audioProcessor = AudioProcessor()
-                try? whisperKit.audioProcessor.startRecordingLive(inputDeviceID: nil) { [weak self] _ in
-                    guard let self else { return }
-                    Task { await self.updateBufferState() }
-                }
-                
-                // Reset state for new bubble but preserve lastAgreedSeconds for potential continuation
-                // Don't call full reset() - just reset the necessary fields
-                eagerResults = []
-                prevResult = nil
-                prevWords = []
-                lastAgreedWords = []
-                confirmedWords = []
-                confirmedText = ""
-                hypothesisWords = []
-                hypothesisText = ""
-                currentText = ""
-                currentFallbacks = 0
-                currentDecodingLoops = 0
-                lastSpeechTime = Date()
-                recentHypotheses = []
-                bufferEnergy = []
-                bufferSeconds = 0
-                bufferResetDone = false  // Reset flag for next silence period
-                
-                // Reset lastAgreedSeconds to 0 for fresh start on new bubble
-                lastAgreedSeconds = 0.0
-                
-                print("[TranscriptionManager] ✅ Reset complete, ready for new audio")
-                return
-
-            }
-            
             try await Task.sleep(nanoseconds: 100_000_000)
             return
         }
         
-        lastSpeechTime = Date()
         silenceDetected = false
         bufferResetDone = false  // Reset flag when speech is detected
         
         print("[TranscriptionManager] Voice detected, transcribing...")
         
+        // CRITICAL: Check silence duration BEFORE transcription
+        // This allows us to create bubbles even if silence markers are being transcribed
+        let silenceDurationBeforeTranscription = Date().timeIntervalSince(lastSpeechTime)
+        let hasAnyTextBeforeTranscription = !confirmedText.isEmpty || !hypothesisText.isEmpty
+        
+        // If we have long silence (1.5s+) AND have text, create new bubble
+        if silenceDurationBeforeTranscription >= silenceDurationForSplit && hasAnyTextBeforeTranscription && !silenceDetected {
+            print("[TranscriptionManager] 🔔 Long silence detected BEFORE transcription (\(String(format: "%.1f", silenceDurationBeforeTranscription))s), creating new bubble")
+            silenceDetected = true
+            
+            // ✅ CRITICAL: Finalize hypothesis FIRST before saving bubble
+            if !hypothesisText.isEmpty {
+                print("[TranscriptionManager] 📝 Finalizing hypothesis before bubble creation: '\(hypothesisText)'")
+                confirmedText += hypothesisText
+                confirmedWords.append(contentsOf: hypothesisWords)
+                
+                hypothesisWords = []
+                hypothesisText = ""
+            }
+            
+            // Update UI with finalized text BEFORE triggering callback
+            let finalText = confirmedText
+            print("[TranscriptionManager] ✅ Finalized text for bubble: '\(finalText)'")
+            onLiveUpdate(finalText, finalText)
+
+            // CRITICAL: Small delay to ensure UI updates before callback
+            try? await Task.sleep(nanoseconds: 50_000_000)  // 50ms
+
+            // NOW trigger bubble creation with complete finalized text
+            print("[TranscriptionManager] 💾 Triggering onSilenceDetected callback")
+            onSilenceDetected()
+
+            // Wait for bubble to be saved before resetting
+            try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
+            
+            // Reset audio buffer and prepare for next speech
+            print("[TranscriptionManager] 🔄 Resetting audio processor")
+            whisperKit.audioProcessor.stopRecording()
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            whisperKit.audioProcessor = AudioProcessor()
+            try? whisperKit.audioProcessor.startRecordingLive(inputDeviceID: nil) { [weak self] _ in
+                guard let self else { return }
+                Task { await self.updateBufferState() }
+            }
+            
+            // Reset state for new bubble
+            eagerResults = []
+            prevResult = nil
+            prevWords = []
+            lastAgreedWords = []
+            confirmedWords = []
+            confirmedText = ""
+            hypothesisWords = []
+            hypothesisText = ""
+            currentText = ""
+            currentFallbacks = 0
+            currentDecodingLoops = 0
+            lastSpeechTime = Date()
+            recentHypotheses = []
+            bufferEnergy = []
+            bufferSeconds = 0
+            bufferResetDone = false
+            
+            // Reset lastAgreedSeconds to 0 for fresh start on new bubble
+            lastAgreedSeconds = 0.0
+            
+            print("[TranscriptionManager] ✅ Reset complete, ready for new audio")
+            return
+        }
+        
         // Transcribe using eager mode
         try await transcribeEagerMode(samples: Array(currentBuffer), whisperKit: whisperKit)
+        
+        // Helper function to check if text is meaningful (not just silence markers)
+        func isMeaningfulText(_ text: String) -> Bool {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Ignore if empty
+            if trimmed.isEmpty {
+                return false
+            }
+            // Check if it's just silence markers like "[ Silence ]", "[silence]", etc.
+            let silencePatterns = ["[silence]", "[ silence ]", "[silence", "silence]", "[blankaudio]", "[ blank audio ]", "[blank", "blank]", "[ silence", "silence ]"]
+            let lowerText = trimmed.lowercased()
+            for pattern in silencePatterns {
+                if lowerText == pattern || lowerText.trimmingCharacters(in: CharacterSet(charactersIn: "[] ")) == "silence" || lowerText.trimmingCharacters(in: CharacterSet(charactersIn: "[] ")) == "blank" {
+                    return false
+                }
+            }
+            // Check if it only contains brackets and whitespace
+            let withoutBrackets = trimmed.replacingOccurrences(of: "[", with: "").replacingOccurrences(of: "]", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if withoutBrackets.isEmpty || withoutBrackets.lowercased() == "silence" || withoutBrackets.lowercased() == "blank" {
+                return false
+            }
+            return true
+        }
+        
+        // CRITICAL: Only update lastSpeechTime if we got MEANINGFUL NEW transcription
+        // (not just silence markers). This prevents silence markers from resetting the silence timer.
+        // We check hypothesisText because that's the NEW transcription from this cycle
+        let hasMeaningfulTranscription = isMeaningfulText(hypothesisText)
+        
+        if hasMeaningfulTranscription {
+            lastSpeechTime = Date()
+            print("[TranscriptionManager] ✅ Updated lastSpeechTime after meaningful transcription")
+        } else {
+            print("[TranscriptionManager] ⏸️ Skipped updating lastSpeechTime - only silence markers or empty transcription (hypothesis: '\(hypothesisText)')")
+        }
     }
     
     // transcribeEagerMode from WhisperAX ContentView.swift lines 642-731
@@ -474,6 +580,19 @@ actor TranscriptionManager {
             }
             
             let audioDuration = Double(samples.count) / 16000.0
+            
+            // CRITICAL FIX: If lastAgreedSeconds exceeds buffer duration, something is wrong
+            // This can happen if the buffer was reset but lastAgreedSeconds wasn't, or if
+            // the buffer accumulated audio differently than expected. Reset to 0.
+            if Float(lastAgreedSeconds) > Float(audioDuration) {
+                print("[EagerMode] ⚠️ lastAgreedSeconds (\(lastAgreedSeconds)s) > buffer duration (\(audioDuration)s) - resetting to 0")
+                lastAgreedSeconds = 0.0
+                // Also clear prefix tokens since we're starting fresh
+                lastAgreedWords = []
+                prevWords = []
+                prevResult = nil
+            }
+            
             print("[EagerMode] Transcribing \(lastAgreedSeconds)-\(audioDuration) seconds (buffer: \(samples.count) samples)")
             
             let streamingAudio = samples
