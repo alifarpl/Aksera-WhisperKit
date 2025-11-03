@@ -106,7 +106,7 @@ struct ConversationDetailView: View {
                     HStack {
                         Image(systemName: isRecording ? "stop.circle.fill" : "mic.circle.fill")
                             .font(.title2)
-                        Text(isRecording ? "Stop" : "Record")
+                        Text(isRecording ? "Stop" : "Transcribe")
                     }
                     .foregroundColor(.white)
                     .padding(.horizontal, 20)
@@ -122,7 +122,7 @@ struct ConversationDetailView: View {
                             .fill(Color.red)
                             .frame(width: 8, height: 8)
                             .opacity(0.8)
-                        Text("Recording...")
+                        Text("Transcribing...")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }

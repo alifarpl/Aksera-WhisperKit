@@ -14,7 +14,7 @@ import Accelerate
 actor TranscriptionManager {
     // EXACT WhisperAX @AppStorage equivalents
     private let selectedTask: String = "transcribe"
-    private let selectedLanguage: String = "english"
+    private let selectedLanguage: String = "indonesian" // can be changed to english/indonesian
     private let enableTimestamps: Bool = true
     private let enablePromptPrefill: Bool = true
     private let enableCachePrefill: Bool = true
@@ -100,7 +100,7 @@ actor TranscriptionManager {
         
         // WhisperKit initialization from WhisperAX
         let config = WhisperKitConfig(
-            model: "medium",
+            model: "openai_whisper-large-v3-v20240930_626MB",
             computeOptions: ModelComputeOptions(
                 audioEncoderCompute: .cpuAndNeuralEngine,
                 textDecoderCompute: .cpuAndNeuralEngine
