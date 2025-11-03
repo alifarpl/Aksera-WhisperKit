@@ -26,7 +26,7 @@ actor TranscriptionManager {
     private let tokenConfirmationsNeeded: Double = 2
     private let realtimeDelayInterval: Double = 1.0
     
-    // WhisperKit - EXACT like WhisperAX
+    // WhisperKit - like WhisperAX
     private var whisperKit: WhisperKit?
     
     // State
@@ -72,6 +72,7 @@ actor TranscriptionManager {
     private let silenceDurationForSplit: Double = 1.5
     private var lastSpeechTime: Date = Date()
     private var silenceDetected: Bool = false
+    private var bufferResetDone: Bool = false  // Track if buffer was reset during current silence
     
     // Audio state tracking (like WhisperAX bufferEnergy/bufferSeconds)
     private var bufferEnergy: [Float] = []
@@ -209,6 +210,7 @@ actor TranscriptionManager {
         currentDecodingLoops = 0
         lastSpeechTime = Date()
         silenceDetected = false
+        bufferResetDone = false
         bufferEnergy = []
         bufferSeconds = 0
     }
@@ -259,38 +261,51 @@ actor TranscriptionManager {
             // Check for long silence to create new bubble
             let silenceDuration = Date().timeIntervalSince(lastSpeechTime)
             
-            // After 0.5s of silence, move hypothesis to confirmed
-            if !hypothesisText.isEmpty && silenceDuration >= 0.5 {
-                print("[TranscriptionManager] ⏰ Finalizing lingering hypothesis after short silence")
-
-                // Promote hypothesis words to confirmed
-                confirmedText += hypothesisText
-                confirmedWords.append(contentsOf: hypothesisWords)
-
-                // Advance baseline beyond finalized text
-                lastAgreedSeconds = Float(hypothesisWords.last?.end ?? confirmedWords.last?.end ?? 0.0)
-                print("[TranscriptionManager] 🔒 Advanced lastAgreedSeconds → \(lastAgreedSeconds)s after finalizing hypothesis")
+            // After 0.5s of silence, move hypothesis to confirmed and reset buffer
+            // Only do this once per silence period (not repeatedly)
+            if silenceDuration >= 0.5 && silenceDuration < silenceDurationForSplit && !bufferResetDone {
+                var needsBufferReset = false
                 
-                // Reset agreement baseline so WhisperKit doesn’t re-append old suffix
-                prevWords = []
-                lastAgreedWords = []
-                hypothesisWords = []
-                hypothesisText = ""
+                // Finalize hypothesis if present
+                if !hypothesisText.isEmpty {
+                    print("[TranscriptionManager] ⏰ Finalizing lingering hypothesis after short silence")
 
-                onLiveUpdate(confirmedText, confirmedText)
-            }
-            
-            // ✅ Light buffer reset after short silence to avoid re-decoding old data
-            if silenceDuration >= 0.5 {
-                whisperKit.audioProcessor.stopRecording()
-                try? await Task.sleep(nanoseconds: 100_000_000)
-                whisperKit.audioProcessor = AudioProcessor()
-                try? whisperKit.audioProcessor.startRecordingLive(inputDeviceID: nil) { [weak self] _ in
-                    guard let self else { return }
-                    Task { await self.updateBufferState() }
+                    // Promote hypothesis words to confirmed
+                    confirmedText += hypothesisText
+                    confirmedWords.append(contentsOf: hypothesisWords)
+                    
+                    // Reset agreement baseline so WhisperKit doesn't re-append old suffix
+                    prevWords = []
+                    lastAgreedWords = []
+                    hypothesisWords = []
+                    hypothesisText = ""
+
+                    onLiveUpdate(confirmedText, confirmedText)
+                    needsBufferReset = true
                 }
-
-                print("[TranscriptionManager] 🧹 Flushed old audio buffer after silence, ready for next speech")
+                
+                // ✅ Reset buffer once after short silence - this prepares for new speech
+                // After buffer reset, lastAgreedSeconds needs to be reset to 0 since buffer is fresh
+                if needsBufferReset && bufferSeconds > 0 {
+                    print("[TranscriptionManager] 🧹 Resetting audio buffer after short silence")
+                    
+                    // Store previous value for logging
+                    let previousLastAgreed = lastAgreedSeconds
+                    
+                    whisperKit.audioProcessor.stopRecording()
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    whisperKit.audioProcessor = AudioProcessor()
+                    try? whisperKit.audioProcessor.startRecordingLive(inputDeviceID: nil) { [weak self] _ in
+                        guard let self else { return }
+                        Task { await self.updateBufferState() }
+                    }
+                    
+                    // CRITICAL: Reset lastAgreedSeconds to 0 since buffer is now empty/fresh
+                    // This ensures new speech will be transcribed from the beginning of the new buffer
+                    lastAgreedSeconds = 0.0
+                    bufferResetDone = true
+                    print("[TranscriptionManager] 🔄 Reset lastAgreedSeconds from \(previousLastAgreed)s to 0.0s for fresh buffer")
+                }
             }
             
             else if isTextStable() && !hypothesisText.isEmpty {
@@ -320,35 +335,61 @@ actor TranscriptionManager {
                 print("[TranscriptionManager] Long silence detected (\(silenceDuration)s), creating new bubble")
                 silenceDetected = true
                 
-                // Trigger bubble creation
-                onSilenceDetected()
-                
-                // ✅ Finalize current hypothesis
+                // ✅ CRITICAL: Finalize hypothesis FIRST before saving bubble
                 if !hypothesisText.isEmpty {
+                    print("[TranscriptionManager] 📝 Finalizing hypothesis before bubble creation: '\(hypothesisText)'")
                     confirmedText += hypothesisText
+                    confirmedWords.append(contentsOf: hypothesisWords)
+                    
+                    // Advance baseline beyond finalized text
+                    if let lastHypothesisEnd = hypothesisWords.last?.end {
+                        lastAgreedSeconds = Float(lastHypothesisEnd)
+                        print("[TranscriptionManager] 🔒 Advanced lastAgreedSeconds → \(lastAgreedSeconds)s")
+                    }
+                    
+                    hypothesisWords = []
                     hypothesisText = ""
-                    onLiveUpdate(confirmedText, confirmedText)
-                    print("[TranscriptionManager] ✅ Finalized hypothesis before reset: \(confirmedText)")
                 }
                 
-                // Task {
+                // Update UI with finalized text BEFORE triggering callback
+                let finalText = confirmedText
+                onLiveUpdate(finalText, finalText)
+                print("[TranscriptionManager] ✅ Finalized text for bubble: '\(finalText)'")
+                
+                // NOW trigger bubble creation with complete finalized text
+                onSilenceDetected()
+                
+                // Reset audio buffer and prepare for next speech
                 whisperKit.audioProcessor.stopRecording()
                 try? await Task.sleep(nanoseconds: 200_000_000)
                 whisperKit.audioProcessor = AudioProcessor()
                 try? whisperKit.audioProcessor.startRecordingLive(inputDeviceID: nil) { [weak self] _ in
                     guard let self else { return }
                     Task { await self.updateBufferState() }
-                 //   }
-                    
-                    // Clear prefix tokens and reset state
-//                    self.lastAgreedWords = []
-//                    self.lastAgreedSeconds = 0.0
-//                    self.reset()
-//                    self.lastSpeechTime = Date()
-//                    print("[TranscriptionManager] ✅ Reset complete, ready for new audio")
                 }
                 
-                reset()
+                // Reset state for new bubble but preserve lastAgreedSeconds for potential continuation
+                // Don't call full reset() - just reset the necessary fields
+                eagerResults = []
+                prevResult = nil
+                prevWords = []
+                lastAgreedWords = []
+                confirmedWords = []
+                confirmedText = ""
+                hypothesisWords = []
+                hypothesisText = ""
+                currentText = ""
+                currentFallbacks = 0
+                currentDecodingLoops = 0
+                lastSpeechTime = Date()
+                recentHypotheses = []
+                bufferEnergy = []
+                bufferSeconds = 0
+                bufferResetDone = false  // Reset flag for next silence period
+                
+                // Reset lastAgreedSeconds to 0 for fresh start on new bubble
+                lastAgreedSeconds = 0.0
+                
                 print("[TranscriptionManager] ✅ Reset complete, ready for new audio")
                 return
 
@@ -360,6 +401,7 @@ actor TranscriptionManager {
         
         lastSpeechTime = Date()
         silenceDetected = false
+        bufferResetDone = false  // Reset flag when speech is detected
         
         print("[TranscriptionManager] Voice detected, transcribing...")
         
@@ -368,157 +410,226 @@ actor TranscriptionManager {
     }
     
     // transcribeEagerMode from WhisperAX ContentView.swift lines 642-731
-    private func transcribeEagerMode(samples: [Float], whisperKit: WhisperKit) async throws {
-        print("[EagerMode] Starting transcription")
-        
-        let languageCode = Constants.languages[selectedLanguage, default: Constants.defaultLanguageCode]
-        let task: DecodingTask = selectedTask == "transcribe" ? .transcribe : .translate
-        
-        let options = DecodingOptions(
-            verbose: true,
-            task: task,
-            language: languageCode,
-            temperature: Float(temperatureStart),
-            temperatureFallbackCount: Int(fallbackCount),
-            sampleLength: Int(sampleLength),
-            usePrefillPrompt: enablePromptPrefill,
-            usePrefillCache: enableCachePrefill,
-            skipSpecialTokens: !enableSpecialCharacters,
-            withoutTimestamps: !enableTimestamps,
-            wordTimestamps: true,
-            firstTokenLogProbThreshold: -1.5,
-            chunkingStrategy: .none
-        )
-        
-        // early stopping checks from WhisperAX
-        let decodingCallback: ((TranscriptionProgress) -> Bool?) = { progress in
-            DispatchQueue.main.async {
-                let fallbacks = Int(progress.timings.totalDecodingFallbacks)
-                if progress.text.count < self.currentText.count {
-                    if fallbacks == self.currentFallbacks {
-                        // New window
-                    } else {
-                        print("Fallback occurred: \(fallbacks)")
+        private func transcribeEagerMode(samples: [Float], whisperKit: WhisperKit) async throws {
+            print("[EagerMode] Starting transcription")
+            
+            let languageCode = Constants.languages[selectedLanguage, default: Constants.defaultLanguageCode]
+            let task: DecodingTask = selectedTask == "transcribe" ? .transcribe : .translate
+            
+            let options = DecodingOptions(
+                verbose: true,
+                task: task,
+                language: languageCode,
+                temperature: Float(temperatureStart),
+                temperatureFallbackCount: Int(fallbackCount),
+                sampleLength: Int(sampleLength),
+                usePrefillPrompt: enablePromptPrefill,
+                usePrefillCache: enableCachePrefill,
+                skipSpecialTokens: !enableSpecialCharacters,
+                withoutTimestamps: !enableTimestamps,
+                wordTimestamps: true,
+                firstTokenLogProbThreshold: -1.5,
+                chunkingStrategy: .none
+            )
+            
+            // early stopping checks from WhisperAX
+            let decodingCallback: ((TranscriptionProgress) -> Bool?) = { progress in
+                DispatchQueue.main.async {
+                    let fallbacks = Int(progress.timings.totalDecodingFallbacks)
+                    if progress.text.count < self.currentText.count {
+                        if fallbacks == self.currentFallbacks {
+                            // New window
+                        } else {
+                            print("Fallback occurred: \(fallbacks)")
+                        }
+                    }
+                    self.currentText = progress.text
+                    self.currentFallbacks = fallbacks
+                    self.currentDecodingLoops += 1
+                }
+                
+                // Check early stopping
+                let currentTokens = progress.tokens
+                let checkWindow = Int(self.compressionCheckWindow)
+                if currentTokens.count > checkWindow {
+                    let checkTokens: [Int] = currentTokens.suffix(checkWindow)
+                    let compressionRatio = TextUtilities.compressionRatio(of: checkTokens)
+                    if compressionRatio > options.compressionRatioThreshold! {
+                        print("[EagerMode] Early stopping due to compression threshold")
+                        return false
                     }
                 }
-                self.currentText = progress.text
-                self.currentFallbacks = fallbacks
-                self.currentDecodingLoops += 1
-            }
-            
-            // Check early stopping
-            let currentTokens = progress.tokens
-            let checkWindow = Int(self.compressionCheckWindow)
-            if currentTokens.count > checkWindow {
-                let checkTokens: [Int] = currentTokens.suffix(checkWindow)
-                let compressionRatio = TextUtilities.compressionRatio(of: checkTokens)
-                if compressionRatio > options.compressionRatioThreshold! {
-                    print("[EagerMode] Early stopping due to compression threshold")
+                if progress.avgLogprob! < options.logProbThreshold! {
+                    print("[EagerMode] Early stopping due to logprob threshold")
                     return false
                 }
-            }
-            if progress.avgLogprob! < options.logProbThreshold! {
-                print("[EagerMode] Early stopping due to logprob threshold")
-                return false
+                
+                return nil
             }
             
-            return nil
-        }
-        
-        whisperKit.segmentDiscoveryCallback = { segments in
-            for segment in segments {
-                print("[EagerMode] Discovered segment: \(segment.id): \(segment.start)->\(segment.end)")
-            }
-        }
-        
-        print("[EagerMode] Transcribing \(lastAgreedSeconds)-\(Double(samples.count) / 16000.0) seconds")
-        
-        let streamingAudio = samples
-        
-        // Calculate the real audio length in seconds
-        let audioDuration = Double(samples.count) / 16000.0
-
-        // ✅ Safety: only skip if buffer hasn't grown
-        if Float(audioDuration) - lastAgreedSeconds < 0.2 {
-            print("[EagerMode] 💤 No new audio to transcribe — skipping this loop")
-            return
-        }
-        
-        var streamOptions = options
-        streamOptions.clipTimestamps = [lastAgreedSeconds]
-        let lastAgreedTokens = lastAgreedWords.flatMap { $0.tokens }
-        streamOptions.prefixTokens = lastAgreedTokens
-        
-        print("[EagerMode] Calling transcribe...")
-        let transcription: TranscriptionResult? = try await whisperKit.transcribe(
-            audioArray: streamingAudio,
-            decodeOptions: streamOptions,
-            callback: decodingCallback
-        ).first
-        
-        print("[EagerMode] Transcription complete")
-        
-        // result processing from WhisperAX
-        var skipAppend = false
-        if let result = transcription {
-            hypothesisWords = result.allWords.filter { $0.start >= lastAgreedSeconds }
-            
-            if let prevResult = prevResult {
-                prevWords = prevResult.allWords.filter { $0.start >= lastAgreedSeconds }
-                let commonPrefix = TranscriptionUtilities.findLongestCommonPrefix(prevWords, hypothesisWords)
-                
-                print("[EagerMode] Prev: \"\((prevWords.map { $0.word }).joined())\"")
-                print("[EagerMode] Next: \"\((hypothesisWords.map { $0.word }).joined())\"")
-                print("[EagerMode] Common prefix: \"\((commonPrefix.map { $0.word }).joined())\"")
-                
-                if commonPrefix.count >= Int(tokenConfirmationsNeeded) {
-                    lastAgreedWords = Array(commonPrefix.suffix(Int(tokenConfirmationsNeeded)))
-                    lastAgreedSeconds = lastAgreedWords.first!.start
-                    print("[EagerMode] New last agreed word: \"\(lastAgreedWords.first!.word)\" at \(lastAgreedSeconds)s")
-                    
-                    confirmedWords.append(contentsOf: commonPrefix.prefix(commonPrefix.count - Int(tokenConfirmationsNeeded)))
-                    let currentWords = confirmedWords.map { $0.word }.joined()
-                    print("[EagerMode] Current confirmed: \(currentWords)")
-                } else {
-                    print("[EagerMode] Using same last agreed time \(lastAgreedSeconds)")
-                    skipAppend = true
+            whisperKit.segmentDiscoveryCallback = { segments in
+                for segment in segments {
+                    print("[EagerMode] Discovered segment: \(segment.id): \(segment.start)->\(segment.end)")
                 }
             }
+            
+            let audioDuration = Double(samples.count) / 16000.0
+            print("[EagerMode] Transcribing \(lastAgreedSeconds)-\(audioDuration) seconds (buffer: \(samples.count) samples)")
+            
+            let streamingAudio = samples
+
+            // ✅ Safety: only skip if buffer hasn't grown
+            // After buffer reset, lastAgreedSeconds is 0, so we should always transcribe if there's any audio
+            let newAudioDuration = Float(audioDuration) - lastAgreedSeconds
+            if newAudioDuration < 0.2 && lastAgreedSeconds > 0 {
+                print("[EagerMode] 💤 No new audio to transcribe (new: \(newAudioDuration)s) — skipping this loop")
+                return
+            }
+            
+            if lastAgreedSeconds == 0.0 && audioDuration > 0.1 {
+                print("[EagerMode] 🎯 Fresh buffer with new audio (\(audioDuration)s), transcribing from start")
+            }
+            
+            var streamOptions = options
+            streamOptions.clipTimestamps = [lastAgreedSeconds]
+            let lastAgreedTokens = lastAgreedWords.flatMap { $0.tokens }
+            streamOptions.prefixTokens = lastAgreedTokens
+            
+            print("[EagerMode] Calling transcribe...")
+            let transcription: TranscriptionResult? = try await whisperKit.transcribe(
+                audioArray: streamingAudio,
+                decodeOptions: streamOptions,
+                callback: decodingCallback
+            ).first
+            
+            print("[EagerMode] Transcription complete")
+            
+            // CRITICAL FIX: Process result and handle hypothesis advancement
+            guard let result = transcription else {
+                print("[EagerMode] No transcription result")
+                return
+            }
+            
+            // Get new words starting from our baseline
+            let newWords = result.allWords.filter { $0.start >= lastAgreedSeconds }
+            
+            print("[EagerMode] Got \(newWords.count) new words from transcription")
+            print("[EagerMode] New words: \"\((newWords.map { $0.word }).joined())\"")
+            
+            // If we have a previous result, find agreement
+            if let prevResult = prevResult {
+                let prevWords = prevResult.allWords.filter { $0.start >= lastAgreedSeconds }
+                let commonPrefix = TranscriptionUtilities.findLongestCommonPrefix(prevWords, newWords)
+                
+                print("[EagerMode] Prev: \"\((prevWords.map { $0.word }).joined())\"")
+                print("[EagerMode] Next: \"\((newWords.map { $0.word }).joined())\"")
+                print("[EagerMode] Common prefix: \"\((commonPrefix.map { $0.word }).joined())\" (\(commonPrefix.count) words)")
+                
+                // Check if hypothesis has been stable (same for multiple iterations)
+                let currentHypothesis = newWords.map { $0.word }.joined()
+                let isStableNow = isTextStable() && !hypothesisText.isEmpty && currentHypothesis == hypothesisText
+                
+                // If we have enough agreement, confirm words and advance
+                if commonPrefix.count >= Int(tokenConfirmationsNeeded) {
+                    // Keep last N words as agreement baseline
+                    lastAgreedWords = Array(commonPrefix.suffix(Int(tokenConfirmationsNeeded)))
+                    
+                    // Confirm all except the last N words
+                    let wordsToConfirm = commonPrefix.prefix(commonPrefix.count - Int(tokenConfirmationsNeeded))
+                    
+                    // CRITICAL: If wordsToConfirm is empty BUT hypothesis is stable, finalize it
+                    if wordsToConfirm.isEmpty && isStableNow {
+                        print("[EagerMode] 🔒 Hypothesis stable with exact agreement - finalizing all \(commonPrefix.count) words")
+                        
+                        // Finalize all agreed words
+                        confirmedWords.append(contentsOf: commonPrefix)
+                        
+                        // Advance past the finalized content
+                        if let lastWord = commonPrefix.last {
+                            lastAgreedSeconds = lastWord.end
+                            print("[EagerMode] ✅ Advanced lastAgreedSeconds → \(lastAgreedSeconds)s (end of '\(lastWord.word)')")
+                        }
+                        
+                        // Clear agreement baseline for fresh start
+                        lastAgreedWords = []
+                        hypothesisWords = []
+                        recentHypotheses.removeAll()
+                    } else if !wordsToConfirm.isEmpty {
+                        // Normal case: confirm some words, keep others as hypothesis
+                        confirmedWords.append(contentsOf: wordsToConfirm)
+                        
+                        // CRITICAL: Advance lastAgreedSeconds to the END of the last confirmed word
+                        // This ensures we don't re-transcribe confirmed content
+                        if let lastConfirmedWord = wordsToConfirm.last {
+                            lastAgreedSeconds = lastConfirmedWord.end
+                            print("[EagerMode] ✅ Advanced lastAgreedSeconds → \(lastAgreedSeconds)s (end of '\(lastConfirmedWord.word)')")
+                        }
+                        
+                        // Update hypothesis to be everything after confirmed
+                        hypothesisWords = Array(newWords.suffix(Int(tokenConfirmationsNeeded)))
+                    } else {
+                        // Edge case: exact agreement but not stable yet - just update hypothesis
+                        hypothesisWords = Array(newWords.suffix(Int(tokenConfirmationsNeeded)))
+                    }
+                    
+                    let currentWords = confirmedWords.map { $0.word }.joined()
+                    print("[EagerMode] Confirmed words: \(currentWords)")
+                    
+                } else {
+                    // Not enough agreement - this happens when transcription changes significantly
+                    print("[EagerMode] ⚠️ Insufficient agreement (\(commonPrefix.count) < \(Int(tokenConfirmationsNeeded)))")
+                    
+                    // If previous hypothesis was stable and we're seeing new different content,
+                    // it likely means the user continued speaking
+                    if !hypothesisWords.isEmpty && isTextStable() {
+                        print("[EagerMode] 🔄 Finalizing previous stable hypothesis before processing new speech")
+                        
+                        // Finalize the stable hypothesis
+                        confirmedWords.append(contentsOf: hypothesisWords)
+                        if let lastHypWord = hypothesisWords.last {
+                            lastAgreedSeconds = lastHypWord.end
+                            print("[EagerMode] 🔒 Advanced lastAgreedSeconds → \(lastAgreedSeconds)s after finalizing hypothesis")
+                        }
+                        
+                        // Clear hypothesis for new content
+                        hypothesisWords = []
+                        lastAgreedWords = []
+                        recentHypotheses.removeAll()
+                    }
+                    
+                    // Use new words as hypothesis
+                    hypothesisWords = newWords
+                }
+            } else {
+                // First result - everything is hypothesis
+                print("[EagerMode] First result - treating as hypothesis")
+                hypothesisWords = newWords
+            }
+            
             prevResult = result
-        } else {
-            print("[EagerMode] No transcription result")
-        }
-        
-        if !skipAppend {
             eagerResults.append(transcription)
-        }
-        
-        // final text assembly from WhisperAX
-        let finalWords = confirmedWords.map { $0.word }.joined()
-        confirmedText = finalWords
-        
-        let lastHypothesis = lastAgreedWords + TranscriptionUtilities.findLongestDifferentSuffix(prevWords, hypothesisWords)
-        hypothesisText = lastHypothesis.map { $0.word }.joined()
-        
-        // Track hypothesis history for stability checks
-        recentHypotheses.append(hypothesisText)
-        if recentHypotheses.count > 5 {
-            recentHypotheses.removeFirst()
-        }
-        
-        print("[EagerMode] Confirmed: '\(confirmedText)' | Hypothesis: '\(hypothesisText)'")
-        
-        // Update callbacks
-        let combinedText = confirmedText + hypothesisText
-        onLiveUpdate(combinedText, confirmedText)
-        
-        // Update metrics
-        if let result = transcription {
+            
+            // Assemble final text
+            confirmedText = confirmedWords.map { $0.word }.joined()
+            hypothesisText = hypothesisWords.map { $0.word }.joined()
+            
+            // Track hypothesis history for stability checks
+            recentHypotheses.append(hypothesisText)
+            if recentHypotheses.count > 5 {
+                recentHypotheses.removeFirst()
+            }
+            
+            print("[EagerMode] Confirmed: '\(confirmedText)' | Hypothesis: '\(hypothesisText)'")
+            
+            // Update callbacks
+            let combinedText = confirmedText + hypothesisText
+            onLiveUpdate(combinedText, confirmedText)
+            
+            // Update metrics
             tokensPerSecond = result.timings.tokensPerSecond
             firstTokenTime = result.timings.firstTokenTime
             let totalAudio = Double(samples.count) / 16000.0
             let totalInferenceTime = result.timings.fullPipeline
             effectiveRealTimeFactor = totalInferenceTime / totalAudio
         }
-    }
 }
