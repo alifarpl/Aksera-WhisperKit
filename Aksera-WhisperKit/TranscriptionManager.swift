@@ -258,8 +258,9 @@ actor TranscriptionManager {
         let hasAnyText = !confirmedText.isEmpty || !hypothesisText.isEmpty
         
         // If we have long silence (1.5s+) AND have text, create new bubble regardless of voice detection
+        // IMPORTANT: silenceDurationForSplit is 1.5 seconds - bubbles only created after this threshold
         if silenceDuration >= silenceDurationForSplit && hasAnyText && !silenceDetected {
-            print("[TranscriptionManager] 🔔 Long silence detected by TIME (\(String(format: "%.1f", silenceDuration))s), creating new bubble")
+            print("[TranscriptionManager] 🔔 Long silence detected by TIME (\(String(format: "%.2f", silenceDuration))s >= \(silenceDurationForSplit)s threshold), creating new bubble")
             silenceDetected = true
             
             // ✅ CRITICAL: Finalize hypothesis FIRST before saving bubble
@@ -289,12 +290,25 @@ actor TranscriptionManager {
             
             // Reset audio buffer and prepare for next speech
             print("[TranscriptionManager] 🔄 Resetting audio processor")
-            whisperKit.audioProcessor.stopRecording()
-            try? await Task.sleep(nanoseconds: 200_000_000)
-            whisperKit.audioProcessor = AudioProcessor()
-            try? whisperKit.audioProcessor.startRecordingLive(inputDeviceID: nil) { [weak self] _ in
-                guard let self else { return }
-                Task { await self.updateBufferState() }
+            do {
+                whisperKit.audioProcessor.stopRecording()
+                // Give the audio system time to fully release the device
+                try? await Task.sleep(nanoseconds: 300_000_000)  // 300ms - increased delay
+                
+                whisperKit.audioProcessor = AudioProcessor()
+                
+                // Add small delay before restarting to ensure clean state
+                try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
+                
+                try whisperKit.audioProcessor.startRecordingLive(inputDeviceID: nil) { [weak self] _ in
+                    guard let self else { return }
+                    Task { await self.updateBufferState() }
+                }
+                print("[TranscriptionManager] ✅ Audio processor reset successfully")
+            } catch {
+                // If reset fails, log but don't crash - the system will continue
+                print("[TranscriptionManager] ⚠️ Error resetting audio processor: \(error.localizedDescription)")
+                // Try to continue with existing processor - it might still work
             }
             
             // Reset state for new bubble
@@ -401,19 +415,21 @@ actor TranscriptionManager {
             return
         }
         
-        silenceDetected = false
         bufferResetDone = false  // Reset flag when speech is detected
         
         print("[TranscriptionManager] Voice detected, transcribing...")
         
         // CRITICAL: Check silence duration BEFORE transcription
         // This allows us to create bubbles even if silence markers are being transcribed
+        // IMPORTANT: Do NOT reset silenceDetected flag here - only reset it after meaningful transcription
         let silenceDurationBeforeTranscription = Date().timeIntervalSince(lastSpeechTime)
         let hasAnyTextBeforeTranscription = !confirmedText.isEmpty || !hypothesisText.isEmpty
         
         // If we have long silence (1.5s+) AND have text, create new bubble
+        // IMPORTANT: Only create bubble if silence duration is >= 1.5s (silenceDurationForSplit)
+        // The silenceDetected flag prevents multiple bubbles from being created in quick succession
         if silenceDurationBeforeTranscription >= silenceDurationForSplit && hasAnyTextBeforeTranscription && !silenceDetected {
-            print("[TranscriptionManager] 🔔 Long silence detected BEFORE transcription (\(String(format: "%.1f", silenceDurationBeforeTranscription))s), creating new bubble")
+            print("[TranscriptionManager] 🔔 Long silence detected BEFORE transcription (\(String(format: "%.2f", silenceDurationBeforeTranscription))s >= \(silenceDurationForSplit)s threshold), creating new bubble")
             silenceDetected = true
             
             // ✅ CRITICAL: Finalize hypothesis FIRST before saving bubble
@@ -443,12 +459,25 @@ actor TranscriptionManager {
             
             // Reset audio buffer and prepare for next speech
             print("[TranscriptionManager] 🔄 Resetting audio processor")
-            whisperKit.audioProcessor.stopRecording()
-            try? await Task.sleep(nanoseconds: 200_000_000)
-            whisperKit.audioProcessor = AudioProcessor()
-            try? whisperKit.audioProcessor.startRecordingLive(inputDeviceID: nil) { [weak self] _ in
-                guard let self else { return }
-                Task { await self.updateBufferState() }
+            do {
+                whisperKit.audioProcessor.stopRecording()
+                // Give the audio system time to fully release the device
+                try? await Task.sleep(nanoseconds: 300_000_000)  // 300ms - increased delay
+                
+                whisperKit.audioProcessor = AudioProcessor()
+                
+                // Add small delay before restarting to ensure clean state
+                try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
+                
+                try whisperKit.audioProcessor.startRecordingLive(inputDeviceID: nil) { [weak self] _ in
+                    guard let self else { return }
+                    Task { await self.updateBufferState() }
+                }
+                print("[TranscriptionManager] ✅ Audio processor reset successfully")
+            } catch {
+                // If reset fails, log but don't crash - the system will continue
+                print("[TranscriptionManager] ⚠️ Error resetting audio processor: \(error.localizedDescription)")
+                // Try to continue with existing processor - it might still work
             }
             
             // Reset state for new bubble
@@ -509,8 +538,13 @@ actor TranscriptionManager {
         
         if hasMeaningfulTranscription {
             lastSpeechTime = Date()
-            print("[TranscriptionManager] ✅ Updated lastSpeechTime after meaningful transcription")
+            // CRITICAL: Only reset silenceDetected flag when we get MEANINGFUL transcription
+            // This ensures bubbles are only created after 1.5s of silence, not on every silence detection
+            silenceDetected = false
+            print("[TranscriptionManager] ✅ Updated lastSpeechTime after meaningful transcription, reset silenceDetected flag")
         } else {
+            // Keep silenceDetected flag set if we didn't get meaningful transcription
+            // This prevents bubbles from being created repeatedly during silence
             print("[TranscriptionManager] ⏸️ Skipped updating lastSpeechTime - only silence markers or empty transcription (hypothesis: '\(hypothesisText)')")
         }
     }

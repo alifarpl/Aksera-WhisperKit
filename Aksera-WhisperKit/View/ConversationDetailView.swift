@@ -139,13 +139,18 @@ struct ConversationDetailView: View {
                 if isRecording {
                     stopRecording()
                 }
-                // Reset the transcription manager state
+                // CRITICAL: Re-initialize the transcription manager with new conversation context
+                // This ensures the callback uses the correct conversation ID
                 Task {
+                    await transcriptionManager?.stop()
                     await transcriptionManager?.reset()
                     await MainActor.run {
                         currentLiveText = ""
                         currentFinalizedText = ""
                     }
+                    // Re-initialize with the new conversation context
+                    await initializeTranscriptionManager()
+                    print("🔄 Re-initialized TranscriptionManager for conversation: \(newValue.title) (ID: \(newValue.id))")
                 }
             }
             
@@ -166,8 +171,8 @@ struct ConversationDetailView: View {
     // MARK: - Transcription Methods
     
     private func initializeTranscriptionManager() async {
-        // Capture the conversation ID to ensure we're always saving to the right one
-        let conversationID = conversation.id
+        // CRITICAL: Don't capture conversationID - always use self.conversation.id
+        // This ensures bubbles are saved to the CURRENT conversation, even if user switches
         let context = modelContext
         
         transcriptionManager = TranscriptionManager(
@@ -193,8 +198,9 @@ struct ConversationDetailView: View {
                     // Save combined text (confirmed + hypothesis)
                     let textToSave = self.currentLiveText
                     
-                    // Only save if we have text and we're still on the SAME conversation
-                    if !textToSave.isEmpty && self.conversation.id == conversationID {
+                    // CRITICAL: Always use self.conversation (current conversation) instead of captured ID
+                    // This ensures bubbles save to the conversation that's currently displayed
+                    if !textToSave.isEmpty {
                         let trimmedText = textToSave.trimmingCharacters(in: .whitespacesAndNewlines)
                         guard !trimmedText.isEmpty else { return }
                         
@@ -206,14 +212,15 @@ struct ConversationDetailView: View {
                         )
                         
                         context.insert(newBubble)
+                        // Always use current conversation - this handles conversation switching correctly
                         newBubble.conversation = self.conversation
                         self.conversation.bubbles.append(newBubble)
                         
                         do {
                             try context.save()
-                            print("✅ Bubble saved: \(trimmedText)")
+                            print("✅ Bubble saved to conversation '\(self.conversation.title)' (ID: \(self.conversation.id)): \(trimmedText.prefix(50))...")
                         } catch {
-                            print("Error saving bubble: \(error)")
+                            print("❌ Error saving bubble: \(error)")
                         }
                         
                         // Clear for next bubble
