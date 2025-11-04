@@ -12,7 +12,7 @@ import Accelerate
 
 // MARK: - Transcription Manager - TRUE WhisperAX Implementation
 actor TranscriptionManager {
-    // EXACT WhisperAX @AppStorage equivalents
+    // WhisperAX @AppStorage equivalents
     private let selectedTask: String = "transcribe"
     private let selectedLanguage: String = "indonesian" // can be changed to english/indonesian
     private let enableTimestamps: Bool = true
@@ -46,7 +46,7 @@ actor TranscriptionManager {
         return unique.count == 1
     }
     
-    // EXACT WhisperAX eager mode properties
+    // WhisperAX eager mode properties
     private var eagerResults: [TranscriptionResult?] = []
     private var prevResult: TranscriptionResult?
     private var lastAgreedSeconds: Float = 0.0
@@ -68,7 +68,7 @@ actor TranscriptionManager {
     private var effectiveRealTimeFactor: TimeInterval = 0
     
     // Silence detection for bubble creation
-    private let silenceThreshold: Double = 0.3  // EXACT WhisperAX value
+    private let silenceThreshold: Double = 0.3  // WhisperAX value
     private let silenceDurationForSplit: Double = 1.5
     private var lastSpeechTime: Date = Date()
     private var silenceDetected: Bool = false
@@ -98,9 +98,36 @@ actor TranscriptionManager {
         
         print("[TranscriptionManager] Starting...")
         
+        // Get model folder from bundle resources (added as folder reference in Copy Bundle Resources)
+        let modelFolderName = "openai_whisper-large-v3-v20240930_626MB"
+        
+        guard let modelPathURL = Bundle.main.url(forResource: modelFolderName, withExtension: nil) else {
+            throw NSError(
+                domain: "TranscriptionManager",
+                code: 4,
+                userInfo: [NSLocalizedDescriptionKey: "Model folder '\(modelFolderName)' not found in bundle. Please ensure it's added to the Xcode project as a folder reference in 'Copy Bundle Resources'."]
+            )
+        }
+        
+        let modelPath = modelPathURL.path
+        
+        // Verify model folder contains required files
+        let requiredFiles = ["MelSpectrogram.mlmodelc", "AudioEncoder.mlmodelc", "TextDecoder.mlmodelc", "config.json"]
+        let missingFiles = requiredFiles.filter { fileName in
+            !FileManager.default.fileExists(atPath: (modelPath as NSString).appendingPathComponent(fileName))
+        }
+        
+        if !missingFiles.isEmpty {
+            throw NSError(
+                domain: "TranscriptionManager",
+                code: 5,
+                userInfo: [NSLocalizedDescriptionKey: "Model folder is missing required files: \(missingFiles.joined(separator: ", "))"]
+            )
+        }
+        
         // WhisperKit initialization from WhisperAX
         let config = WhisperKitConfig(
-            model: "openai_whisper-large-v3-v20240930_626MB",
+            modelFolder: modelPath,
             computeOptions: ModelComputeOptions(
                 audioEncoderCompute: .cpuAndNeuralEngine,
                 textDecoderCompute: .cpuAndNeuralEngine
@@ -109,7 +136,7 @@ actor TranscriptionManager {
             logLevel: .debug,
             prewarm: false,
             load: true,
-            download: true
+            download: false //local
         )
         
         print("[TranscriptionManager] Initializing WhisperKit...")
@@ -664,7 +691,32 @@ actor TranscriptionManager {
             }
             
             // Get new words starting from our baseline
-            let newWords = result.allWords.filter { $0.start >= lastAgreedSeconds }
+            var newWords = result.allWords.filter { $0.start >= lastAgreedSeconds }
+            
+            // Filter out hallucinations: reject very short segments that are likely hallucinations
+            // Whisper often hallucinates during silence, producing short segments with high probabilities
+            if !newWords.isEmpty {
+                let segmentStart = newWords.first!.start
+                let segmentEnd = newWords.last!.end
+                let segmentDuration = segmentEnd - segmentStart
+                
+                // Check if this is likely a hallucination:
+                // 1. Very short duration (< 0.15s) - real speech is usually longer
+                // 2. High average word probability (> 0.85) for such short segments is suspicious
+                let avgProbability = newWords.map { $0.probability }.reduce(0.0, +) / Float(newWords.count)
+                
+                // Also check recent audio energy
+                let recentEnergy = bufferEnergy.isEmpty ? 0.0 : bufferEnergy.suffix(10).reduce(0.0, +) / Float(min(10, bufferEnergy.count))
+                
+                if segmentDuration < 0.35 && avgProbability > 0.85 && recentEnergy < Float(silenceThreshold) {
+                    print("[EagerMode] ❌ Rejecting hallucination: duration=\(String(format: "%.3f", segmentDuration))s, avgProb=\(String(format: "%.2f", avgProbability)), energy=\(String(format: "%.3f", recentEnergy))")
+                    // Clear the words to prevent them from being processed
+                    newWords = []
+                } else if segmentDuration < 0.35 && avgProbability > 0.9 {
+                    // Even without low energy, very short + very high prob is suspicious
+                    print("[EagerMode] ⚠️ Suspicious short segment: duration=\(String(format: "%.3f", segmentDuration))s, avgProb=\(String(format: "%.2f", avgProbability)) - keeping but may be hallucination")
+                }
+            }
             
             print("[EagerMode] Got \(newWords.count) new words from transcription")
             print("[EagerMode] New words: \"\((newWords.map { $0.word }).joined())\"")
